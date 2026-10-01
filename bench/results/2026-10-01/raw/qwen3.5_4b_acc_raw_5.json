@@ -1,0 +1,1 @@
+{"model":"qwen3.5:4b","created_at":"2026-10-01T20:24:28.311625466Z","message":{"role":"assistant","content":"sudo dnf install firefox"},"done":true,"done_reason":"stop","total_duration":183361192,"load_duration":805988,"prompt_eval_count":32,"prompt_eval_cached_count":0,"prompt_eval_duration":60612000,"eval_count":6,"eval_duration":79837000}

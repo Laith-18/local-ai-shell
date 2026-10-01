@@ -1,0 +1,1 @@
+{"model":"qwen3.5:4b","created_at":"2026-10-01T20:24:27.777662003Z","message":{"role":"assistant","content":"tail -n 50 /var/log/syslog"},"done":true,"done_reason":"stop","total_duration":278261394,"load_duration":787910,"prompt_eval_count":30,"prompt_eval_cached_count":0,"prompt_eval_duration":60586000,"eval_count":12,"eval_duration":173664000}

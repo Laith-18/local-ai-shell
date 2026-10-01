@@ -1,0 +1,1 @@
+{"model":"qwen3.5:4b","created_at":"2026-10-01T20:24:30.777202027Z","message":{"role":"assistant","content":"ps aux --sort=-%mem | head -n 11"},"done":true,"done_reason":"stop","total_duration":354936283,"load_duration":778048,"prompt_eval_count":167,"prompt_eval_cached_count":0,"prompt_eval_duration":132502000,"eval_count":15,"eval_duration":219381000}

@@ -1,0 +1,8 @@
+Date: Thu  1 Oct 21:21:06 BST 2026
+PRETTY_NAME="Bazzite"
+Kernel: 7.2.4-ogc3.1.fc44.x86_64
+CPU: Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       2.9Gi       5.9Gi       106Mi       7.0Gi        12Gi
+GPU (name, driver, total, used before test): NVIDIA GeForce RTX 2060, 615.71.09, 6144 MiB, 673 MiB
+Ollama: ollama version is 0.35.0

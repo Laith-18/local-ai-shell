@@ -1,0 +1,1 @@
+{"model":"qwen3.5:4b","created_at":"2026-10-01T20:24:32.684792781Z","message":{"role":"assistant","content":"sudo ss -tlnp | grep 47989"},"done":true,"done_reason":"stop","total_duration":359745226,"load_duration":802430,"prompt_eval_count":171,"prompt_eval_cached_count":0,"prompt_eval_duration":134412000,"eval_count":15,"eval_duration":221652000}

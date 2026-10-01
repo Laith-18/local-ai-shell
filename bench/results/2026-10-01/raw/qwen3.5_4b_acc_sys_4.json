@@ -1,0 +1,1 @@
+{"model":"qwen3.5:4b","created_at":"2026-10-01T20:24:31.503881199Z","message":{"role":"assistant","content":"systemctl --user restart sunshined"},"done":true,"done_reason":"stop","total_duration":267696584,"load_duration":792800,"prompt_eval_count":168,"prompt_eval_cached_count":0,"prompt_eval_duration":139161000,"eval_count":9,"eval_duration":125611000}
