@@ -4,9 +4,6 @@ A private, offline AI assistant for the Linux terminal, running entirely on a sp
 
 Ask it things in plain English. General questions get a straight answer. Questions about the machine get a shell command: read-only commands run straight away and the result is explained in plain English, while anything that changes the system explains *why* it needs permission and waits for you.
 
-<!-- TODO: record a demo and add it here, e.g. with `vhs` or asciinema + agg -->
-![demo](docs/demo.gif)
-
 ```
 ai› how much storage do i have
 
@@ -31,8 +28,8 @@ ai› how much storage do i have
   - *Destructive commands are always blocked* (`rm -rf /`, `mkfs`, `dd` to a disk, fork bombs).
 - **Learns from you.** Say "remember that…", "from now on…" or "when I say…" and it stores the rule and follows it in every future request. If you correct a command with `e` and it succeeds, it offers to remember the fix. Manage it with `/learned` and `/unlearn`.
 - **Follow-up questions** ("now sort that by size") via short conversation memory.
-- **Bazzite-aware.** Knows the OS is immutable: uses Flatpak, `ujust`, `distrobox` and `systemctl --user` instead of `dnf`/`apt`.
-- **Plays nicely with gaming.** The model only sits in VRAM while you're using it and is unloaded on exit, so Steam Big Picture and Sunshine streaming get the GPU back.
+- **Support for Immutable Operating Systems.** Knows the OS is immutable: uses Flatpak, `ujust`, `distrobox` and `systemctl --user` instead of `dnf`.
+- **VRAM dynamic.** The model only sits in VRAM while you're using it and is unloaded on exit
 - **Guards against small-model failure modes:** token cap and runaway detection, no keyboard input for auto-run commands, and a rule against guessing facts about the machine.
 - Streaming replies, a welcome screen with live system stats, and speed and load time shown under every answer.
 - Single Python file, standard library only.
@@ -98,8 +95,6 @@ Nine command-generation tasks, graded by hand (full answers in `summary.md`):
 | lfm2.5 | 5/9 | 6/9 |
 | qwen3.5:4b | **2/9** | **7/9** |
 
-Without context, qwen answered with generic Linux, and once with a **Windows** command (`rmdir /s "C:\Users\…"`). With a short system prompt describing the OS, it followed the rules almost perfectly, e.g. `flatpak install flathub org.mozilla.firefox` and `ujust update` instead of `dnf`. The prompt helped lfm2.5 far less, and it even regressed on one task.
-
 ### Thinking can't always be turned off
 
 - **lfm2.5 ignored `think: false` on 100% of requests**, producing identical output with thinking on or off. One-line answers took 1.6–20 s, and one task burned 1,535 tokens of reasoning to produce a nonsense `rpm` command.
@@ -158,14 +153,3 @@ bench/results/       raw data and summaries from each run
 deploy/              container setup
 docs/                demo and notes
 ```
-
-## Next
-
-- [ ] Unit tests for the safety classifier
-- [ ] Fish keybinding: type English at the normal prompt, press Alt+A to turn it into a command
-- [ ] Re-run the benchmark on an RX 9070 XT (16 GB) with larger models
-- [ ] Podman quadlet so Ollama starts on boot
-
-## License
-
-MIT
