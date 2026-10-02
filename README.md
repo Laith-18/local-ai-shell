@@ -1,6 +1,6 @@
 # local-ai-shell
 
-A private, offline AI assistant for the Linux terminal, running entirely on a spare RTX 2060 in my living-room PC.
+A private, offline AI assistant for the Linux terminal.
 
 Ask it things in plain English. General questions get a straight answer. Questions about the machine get a shell command: read-only commands run straight away and the result is explained in plain English, while anything that changes the system explains *why* it needs permission and waits for you.
 
@@ -143,13 +143,3 @@ Inside `ai`: `/help`, `/learned`, `/unlearn <n>`, `/forget`, `/raw`, `/stats`, `
 Use a different model with `ai --model <name>` or `AI_SHELL_MODEL`.
 
 To run the benchmark: `bash bench/ai-bench.sh`.
-
-## Repo layout
-
-```
-ai-shell.py          the assistant
-bench/ai-bench.sh    benchmark: cold start, GPU/CPU speed, thinking, accuracy
-bench/results/       raw data and summaries from each run
-deploy/              container setup
-docs/                demo and notes
-```
