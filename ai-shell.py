@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ai-shell: a terminal assistant for Bazzite, backed by a local Ollama model.
+ai-shell: a terminal assistant for Fedora KDE Plasma, backed by a local Ollama model.
 
 Ask in plain English:
   - General questions get a plain-English answer.
@@ -14,7 +14,7 @@ Usage:
   ai --no-banner                      interactive mode, no welcome screen
 
 In interactive mode: /help, /learned, /unlearn, /forget, /raw, /stats, clear, exit.
-Standard library only, so it runs on the Bazzite host with no pip installs.
+Standard library only, so it runs with the system Python and no pip installs.
 Set AI_SHELL_ANIMATE=0 to turn off the welcome animation.
 """
 
@@ -61,7 +61,7 @@ SUMMARY_INPUT_CHARS = 4000   # how much command output the model gets to read
 HISTORY_MESSAGES = 6         # remembered messages for follow-up questions
 
 # ------------------------------------------------------------------ prompts --
-ROUTER_PROMPT = """You are ai-shell, a friendly assistant living in a terminal on Bazzite, an immutable Fedora Atomic-based gaming distro.
+ROUTER_PROMPT = """You are ai-shell, a friendly assistant living in a terminal on Fedora Linux with the KDE Plasma desktop.
 
 Decide what the user needs:
 - If answering needs information from this computer, or they want something done on it, reply with ONE line: "$ " followed by a single shell command. Nothing else.
@@ -76,12 +76,13 @@ Command rules:
 - To write a file, use a heredoc: the first line is $ cat > /path/to/file << 'EOF' then the file's
   content on the following lines, then EOF alone on the last line. This is the only time you may
   reply with more than one line.
-- The base system is read-only: never use dnf, yum or apt.
-- Install GUI apps with Flatpak from Flathub, e.g. $ flatpak install flathub org.mozilla.firefox
-  If unsure of an app's exact Flathub ID, use the plain name, e.g. $ flatpak install flathub discord
-- Update the whole system with: $ ujust update
-- Use distrobox for command-line tools that aren't in the base image. Containers use podman, not docker.
+- Install software with dnf, e.g. $ sudo dnf install htop  (never yum, apt or rpm-ostree). RPM Fusion is enabled.
+- GUI apps can also come from Flathub, e.g. $ flatpak install flathub discord
+- Update the whole system with: $ sudo dnf upgrade --refresh
+- Never remove the NVIDIA driver (akmod-nvidia) or kernel packages unless the user asks for exactly that.
+- Containers use podman, not docker.
 - Sunshine runs as a systemd user service named exactly "sunshine": manage it with systemctl --user <action> sunshine
+- Ollama runs as a system service named "ollama": manage it with sudo systemctl <action> ollama
 - Logs come from journalctl; there is no /var/log/syslog.
 - Only use sudo when actually required.
 
@@ -90,13 +91,13 @@ Things the user has taught you. Always follow these; they override everything ab
 
 Context: {context}"""
 
-SUMMARY_PROMPT = """You are ai-shell on Bazzite Linux. You ran a command for the user; now explain the result.
+SUMMARY_PROMPT = """You are ai-shell on Fedora Linux (KDE Plasma). You ran a command for the user; now explain the result.
 Answer their original question directly in plain English, in 1-3 short sentences, using specific numbers and names from the output. No markdown, and don't restate the command.
 If the output already answers the question, just say it naturally in one short sentence.
 If the command failed, say what went wrong and suggest a fix in one sentence.
 If the output is empty, say so plainly; never claim something worked unless the output shows it.
-Never suggest dnf, yum or apt: Bazzite is immutable. Updates are done with: ujust update
-Bazzite quirks: 'composefs' mounted at / is always 100% full because it's the read-only system image, so ignore it. /etc, /var and /var/home are normally the same partition, so count it once."""
+Software is installed with dnf (never apt or rpm-ostree). Updates are done with: sudo dnf upgrade --refresh
+Fedora quirks: / and /home are btrfs subvolumes on the same partition, so count that space once. Ignore tmpfs, efivarfs and zram entries."""
 
 EXPLAIN_PROMPT = """In one short sentence for a non-expert, say what this Linux command will change on the computer. Start with a verb. No markdown."""
 
@@ -134,15 +135,17 @@ BLOCKED = [
 PERMISSION_RULES = [
     (r"\b(sudo|pkexec|run0)\b", "runs as root", False),
     (r"\b(rm|shred|unlink)\b", "deletes files", True),
-    (r"\b(dnf|yum|apt|apt-get)\b", "uses a package manager that doesn't work on Bazzite", False),
-    (r"\brpm-ostree\b", "changes the base OS image", True),
+    (r"\b(dnf|dnf5)\b.*\b(remove|erase|autoremove|swap|distro-sync|system-upgrade|downgrade)\b",
+     "removes software or changes the whole system", True),
+    (r"\b(dnf|dnf5)\b.*\b(install|reinstall|upgrade|update)\b", "installs or updates software", False),
+    (r"\b(yum|apt|apt-get|rpm-ostree)\b", "uses a tool that isn't Fedora's package manager", False),
+    (r"\brpm\b\s+-(i|U|e|F)", "installs or removes a package directly", True),
     (r"\b(shutdown|reboot|poweroff|halt)\b", "shuts down or restarts the machine", True),
     (r"\b(curl|wget)\b.*\|\s*(sudo\s+)?(ba|z)?sh\b", "runs a script from the internet", True),
     (r"\b(kill|killall|pkill)\b", "stops running programs", True),
     (r"\b(chmod|chown)\b", "changes file permissions", True),
     (r"\bflatpak\b.*\b(install|uninstall|remove|update)\b", "installs, removes or updates apps", False),
     (r"\bsystemctl\b.*\b(start|stop|restart|enable|disable|mask)\b", "starts, stops or changes a service", False),
-    (r"\bujust\b", "runs a Bazzite system task", False),
     (r"\b(mv|cp)\b", "moves or copies files", False),
     (r"-delete\b", "deletes files", True),
     (r"\bsed\b.*\s-i", "edits a file in place", False),
@@ -167,8 +170,10 @@ READ_ONLY_SUBCOMMANDS = {
                   "list-unit-files", "list-timers", "list-sockets", "show", "cat"},
     "flatpak": {"list", "info", "search", "remotes", "remote-ls", "history", "ps"},
     "podman": {"ps", "images", "logs", "inspect", "version", "info", "top", "port"},
-    "rpm-ostree": {"status"},
-    "distrobox": {"list", "ls"},
+    "dnf": {"list", "info", "search", "repolist", "repoquery", "provides", "check-update",
+            "check-upgrade"},
+    "dnf5": {"list", "info", "search", "repolist", "repoquery", "provides", "check-update",
+             "check-upgrade"},
     "git": {"status", "log", "diff", "show"},
     "loginctl": {None, "list-sessions", "list-users", "show-session", "show-user",
                  "session-status", "user-status"},
@@ -219,6 +224,8 @@ def segment_is_read_only(segment):
 
     if name == "ip":
         return not any(a in IP_WRITE_WORDS for a in args)
+    if name == "rpm":  # only queries (rpm -qa, rpm -qf, rpm -qi ...) are read-only
+        return bool(args) and (args[0].startswith("-q") or args[0] == "--query")
     if name in READ_ONLY_SUBCOMMANDS:
         sub = next((a for a in args if not a.startswith("-")), None)
         return sub in READ_ONLY_SUBCOMMANDS[name]
@@ -412,7 +419,7 @@ def footer(seconds, load_seconds, final=None):
 def offline_message(err):
     reason = getattr(err, "reason", err)
     print(f"\n  {paint('Can’t reach the AI', RED, BOLD)} at {OLLAMA_URL} ({reason}).")
-    print(paint("  Start it with: systemctl --user start ollama   (or: podman start ollama)", DIM))
+    print(paint("  Start it with: sudo systemctl start ollama", DIM))
 
 
 # ---------------------------------------------------------------- banner -----
@@ -422,7 +429,7 @@ LOGO = [
 ]
 GRADIENT = [51, 45, 39, 33, 63, 99, 135, 171, 207, 201]
 EXAMPLES = ["how much storage do i have", "is sunshine running", "what's using my GPU",
-            "install discord", "how hot is my GPU", "what is a flatpak",
+            "install htop", "how hot is my GPU", "is my system up to date",
             "which process is using the most memory", "show my IP address"]
 
 
@@ -454,7 +461,7 @@ def gather_stats(model):
         else:
             stats["model"] = (f"{model} · {paint('idle', YELLOW)}, loads on your first question", version)
     except Exception:  # noqa: BLE001
-        stats["model"] = (f"{model} · {paint('offline', RED)} · run: systemctl --user start ollama", None)
+        stats["model"] = (f"{model} · {paint('offline', RED)} · run: sudo systemctl start ollama", None)
 
     if shutil.which("nvidia-smi"):
         try:
@@ -558,7 +565,7 @@ HELP = """
   Teach me things and I'll remember them for good:
     remember that "clear" means clear the screen
     from now on, show sizes in GB
-    when I say "games", I mean the folder /var/mnt/gamedrive
+    when I say "games", I mean the folder /mnt/gamedrive
   If you fix a command with e, I'll offer to remember the fix.
 
   clear       clear the screen
@@ -683,7 +690,7 @@ def looks_like_command(line):
         word = shlex.split(line)[0]
     except (ValueError, IndexError):
         return False
-    return shutil.which(word) is not None or word in READ_ONLY_SUBCOMMANDS or word == "ujust"
+    return shutil.which(word) is not None or word in READ_ONLY_SUBCOMMANDS
 
 
 def decide(buffer, finished):
@@ -1050,7 +1057,7 @@ def interactive(session, show_banner):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plain-English terminal assistant for Bazzite.")
+    parser = argparse.ArgumentParser(description="Plain-English terminal assistant for Fedora.")
     parser.add_argument("request", nargs="*", help="ask once and exit")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default {DEFAULT_MODEL})")
     parser.add_argument("--no-banner", action="store_true", help="skip the welcome screen")
