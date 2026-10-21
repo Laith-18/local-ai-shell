@@ -1,0 +1,15 @@
+[Unit]
+Description=Ollama no-think proxy (port 11435)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+User=laith
+ExecStart=/usr/bin/python3 /home/laith/projects/local-ai-shell/proxy/ollama-nothink-proxy.py
+Environment=PROXY_LISTEN=0.0.0.0:11435
+Environment=OLLAMA_UPSTREAM=http://127.0.0.1:11434
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
