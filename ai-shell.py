@@ -19,6 +19,7 @@ Set AI_SHELL_ANIMATE=0 to turn off the welcome animation.
 """
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -26,6 +27,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -796,6 +798,31 @@ def run_in_terminal(cmd):
     return code, "\n".join(lines).strip()
 
 
+@contextlib.contextmanager
+def child_owns_ctrl_c():
+    """While a command runs, let Ctrl+C go to the command only, like a real shell does.
+
+    The child is in the terminal's foreground process group, so it receives SIGINT
+    itself and decides what to do. If ai-shell also reacted, a KeyboardInterrupt
+    could land anywhere (e.g. inside proc.wait()) and crash the whole session.
+    Must be entered *after* the child has started, otherwise the child would
+    inherit SIG_IGN and Ctrl+C would stop working for it too.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def exit_code(returncode):
+    """Normalise Popen's 'killed by signal N' (-N) to the shell convention (128+N)."""
+    return 128 - returncode if returncode < 0 else returncode
+
+
 def run_command(cmd, show_output, cap_lines, allow_input=True):
     """Run with live output; returns (exit_code, captured_output, was_interactive)."""
     if allow_input and shutil.which("script") and first_program(cmd) not in INTERACTIVE:
@@ -803,10 +830,9 @@ def run_command(cmd, show_output, cap_lines, allow_input=True):
         return code, output, False
     if first_program(cmd) in INTERACTIVE:
         print()
-        try:
-            code = subprocess.run(cmd, shell=True, executable="/bin/bash").returncode
-        except KeyboardInterrupt:
-            code = 130
+        proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash")
+        with child_owns_ctrl_c():
+            code = exit_code(proc.wait())
         return code, "", True
 
     proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash",
@@ -815,7 +841,7 @@ def run_command(cmd, show_output, cap_lines, allow_input=True):
     chunks, shown, hidden, line_start = [], 0, 0, True
     if show_output:
         print()
-    try:
+    with child_owns_ctrl_c():
         while True:
             data = os.read(proc.stdout.fileno(), 4096)
             if not data:
@@ -834,9 +860,7 @@ def run_command(cmd, show_output, cap_lines, allow_input=True):
                 line_start = ends_line
                 shown += ends_line
             sys.stdout.flush()
-    except KeyboardInterrupt:
-        pass  # Ctrl+C reaches the child too; just wait for it to exit
-    code = proc.wait()
+        code = exit_code(proc.wait())
     if show_output and not line_start:
         print()
     if hidden:
@@ -1036,7 +1060,12 @@ def interactive(session, show_banner):
                 print()
                 print_stats(session.model)
             else:
-                handle(session, request)
+                try:
+                    handle(session, request)
+                except KeyboardInterrupt:
+                    # Ctrl+C mid-request (e.g. while explaining or summarising)
+                    # cancels that request, not the whole session.
+                    print(paint("\n  Stopped.", DIM))
     finally:
         if readline:
             try:
@@ -1057,7 +1086,11 @@ def main():
     args = parser.parse_args()
 
     if args.request:
-        handle(Session(args.model, keep_alive="2m"), " ".join(args.request))
+        try:
+            handle(Session(args.model, keep_alive="2m"), " ".join(args.request))
+        except KeyboardInterrupt:
+            print(paint("\n  Stopped.", DIM))
+            sys.exit(130)
     else:
         interactive(Session(args.model, keep_alive="10m"), not args.no_banner)
 
