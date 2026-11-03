@@ -212,6 +212,7 @@ FORBIDDEN_SHORT_LETTERS = {"sort": "o", "ss": "K"}
 # Options that take a value, so the next word isn't a file name (used for uniq).
 UNIQ_VALUE_FLAGS = {"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"}
 # GNU sed: s///e and the e command run shell commands; w/W write files.
+AWK_SIDE_EFFECTS = re.compile(r"system\s*\(|getline|[|>]")
 SED_SUBST_RE = re.compile(r"""[sy]([^\\\n])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1([A-Za-z0-9]*)""")
 SED_ADDRESS_RE = re.compile(r"/(?:\\.|[^/\\])*/|\\(.)(?:\\.|(?!\1).)*\1")
 IP_WRITE_WORDS = {"set", "add", "del", "delete", "flush", "change", "replace", "append"}
@@ -318,18 +319,57 @@ def segment_is_read_only(segment):
         return False  # without -c, ping never stops
     if name == "hostname" and any(not a.startswith("-") for a in args):
         return False  # 'hostname newname' renames the machine
-    if name == "awk" and "system(" in segment:
-        return False
+    if name == "awk" and AWK_SIDE_EFFECTS.search(segment):
+        return False  # awk can write files (print > f), pipe to a shell (print | "sh") or run commands
     return True
+
+
+def mask_quoted(cmd):
+    """Same length as cmd, with everything inside quotes (and escaped chars) replaced by '_'.
+
+    Lets shell operators like | ; & > be found only where the shell would see them,
+    so grep -E "a|b" is one command, not two. Unclosed quotes mask to the end.
+    """
+    out, quote, i = [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            if c == quote:
+                quote = None
+                out.append(c)
+            elif c == "\\" and quote == '"' and i + 1 < len(cmd):
+                out += "__"
+                i += 1
+            else:
+                out.append("_")
+        elif c == "\\" and i + 1 < len(cmd):
+            out += "__"
+            i += 1
+        else:
+            if c in "'\"":
+                quote = c
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def split_segments(cmd):
+    """Split on |, ||, &&, ;, & and newlines that are outside quotes."""
+    masked, segments, start = mask_quoted(cmd), [], 0
+    for m in SEGMENT_SPLIT.finditer(masked):
+        segments.append(cmd[start:m.start()])
+        start = m.end()
+    segments.append(cmd[start:])
+    return [s.strip() for s in segments if s.strip()]
 
 
 def is_read_only(cmd):
     if "$(" in cmd or "`" in cmd:
-        return False  # command substitution could hide anything
+        return False  # command substitution could hide anything (even inside double quotes)
     stripped = SAFE_REDIRECTS.sub("", cmd)
-    if ">" in stripped:
+    if ">" in mask_quoted(stripped):
         return False  # writes to a file
-    segments = [s.strip() for s in SEGMENT_SPLIT.split(stripped) if s.strip()]
+    segments = split_segments(stripped)
     return bool(segments) and all(segment_is_read_only(s) for s in segments)
 
 
@@ -348,7 +388,7 @@ def assess(cmd):
 
 def first_program(cmd):
     try:
-        tokens = tokens_for(SEGMENT_SPLIT.split(cmd)[0])
+        tokens = tokens_for((split_segments(cmd) or [""])[0])
     except ValueError:
         return ""
     return os.path.basename(tokens[0]) if tokens else ""
