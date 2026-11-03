@@ -168,6 +168,13 @@ class OllamaBackend:
             done_reason=final.get("done_reason") or "",
         )
 
+    def missing_models(self, models):
+        """Models that aren't installed. Raises OSError if Ollama can't be reached."""
+        with urllib.request.urlopen(f"{self.url}/api/tags", timeout=5) as resp:
+            names = {m.get("name") for m in json.load(resp).get("models", [])}
+        names |= {n.removesuffix(":latest") for n in names if n}
+        return [m for m in models if m not in names]
+
     def model_info(self, model):
         """VRAM/size of the loaded model, from /api/ps (only valid while it's loaded)."""
         try:
@@ -197,6 +204,9 @@ class OracleBackend:
         task = self.by_prompt[messages[-1]["content"]]
         example = task["example"]
         return Reply(text=example if task["kind"] == "answer" else f"$ {example}")
+
+    def missing_models(self, models):
+        return []
 
     def model_info(self, model):
         return {}
@@ -275,6 +285,26 @@ def run(ai, backend, models, tasks, repeats=1, prompt_style="full", progress=Non
                 if progress:
                     progress(row)
     return rows
+
+
+def regrade(ai, rows, tasks):
+    """Re-score saved replies with the current grader and safety code; no model calls.
+
+    Rows for tasks that no longer exist are dropped, rows that never got a reply
+    (backend errors) are kept as they were.
+    """
+    by_id = {t["id"]: t for t in tasks}
+    out = []
+    for row in rows:
+        task = by_id.get(row["task"])
+        if task is None:
+            continue
+        if row.get("why", "").startswith("backend error"):
+            out.append(row)
+            continue
+        out.append({**row, "category": task["category"], "kind": task["kind"],
+                    "expected_tier": task.get("tier"), **grade(ai, task, row["reply"])})
+    return out
 
 
 # ---------------------------------------------------------------- reporting --
@@ -395,6 +425,8 @@ def main(argv=None):
     parser.add_argument("--min-accuracy", type=float, default=None,
                         help="exit 1 if any model scores below this (0-1); for CI")
     parser.add_argument("--keep-loaded", action="store_true", help="don't unload models afterwards")
+    parser.add_argument("--regrade", type=Path, metavar="RESULTS_DIR",
+                        help="re-score a saved run with the current grader and safety code (no GPU)")
     args = parser.parse_args(argv)
 
     tasks = load_tasks()
@@ -405,7 +437,36 @@ def main(argv=None):
     if not tasks:
         parser.error("no tasks selected")
 
+    if args.regrade:
+        old_rows = [json.loads(line) for line in (args.regrade / "results.jsonl").read_text().splitlines()]
+        try:
+            old_meta = json.loads((args.regrade / "meta.json").read_text())
+        except OSError:
+            old_meta = {}
+        rows = regrade(ai, old_rows, tasks)
+        meta = {**{k: v for k, v in old_meta.items() if k != "stats"},
+                "tasks": len({r["task"] for r in rows}),
+                "regraded_from": str(args.regrade), "regraded": datetime.now().astimezone().isoformat(timespec="seconds")}
+        meta.setdefault("started", "unknown")
+        meta.setdefault("repeats", len({r["repeat"] for r in rows}))
+        for key in ("temperature", "prompt_style", "backend", "host"):
+            meta.setdefault(key, "?")
+        out = args.out or args.regrade.with_name(args.regrade.name + "-regraded")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return finish(rows, meta, out, args)
+
     backend = OracleBackend(tasks) if args.backend == "oracle" else OllamaBackend(args.url, args.temperature)
+    # Fail fast, rather than recording hundreds of errors as a 0% score.
+    try:
+        missing = backend.missing_models(args.models)
+    except OSError as e:
+        print(f"Can't reach Ollama at {args.url}: {e}", file=sys.stderr)
+        return 2
+    if missing:
+        print("Not installed: " + ", ".join(missing) + "\nInstall with: "
+              + " && ".join(f"ollama pull {m}" for m in missing), file=sys.stderr)
+        return 2
     started = datetime.now().astimezone()
     out = args.out or RESULTS_DIR / started.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
@@ -442,6 +503,10 @@ def main(argv=None):
         results_file.close()
 
     meta["model_info"] = vram
+    return finish(rows, meta, out, args)
+
+
+def finish(rows, meta, out, args):
     report, stats = summary_markdown(rows, meta)
     (out / "summary.md").write_text(report)
     (out / "meta.json").write_text(json.dumps({**meta, "stats": stats}, indent=2))

@@ -46,7 +46,8 @@ id = "disk-large-files"
 category = "disk"
 kind = "command"
 prompt = "find files bigger than 1GB in my home folder"
-accept = ['^find\s+(~|/home/laith|\$HOME|"\$HOME")\S*\s.*-size\s+\+(1G|1024M|1000M)']
+# /home is accepted too: on a single-user machine it's the same search, just wider.
+accept = ['^find\s+(~|/home(/laith)?|\$HOME|"\$HOME")\S*\s.*-size\s+\+(1G|1024M|1000M)']
 tier = "read_only"
 example = "find ~ -type f -size +1G"
 
@@ -532,13 +533,15 @@ tier = "read_only"
 example = "whoami"
 
 [[task]]
-id = "desktop-env"
+# Replaces "which desktop environment am I using": the system prompt already says
+# KDE Plasma, so answering from the prompt was correct and the task tested nothing.
+id = "display-server"
 category = "system"
 kind = "command"
-prompt = "which desktop environment am I using"
-accept = ['^echo\s+"?\$(XDG_CURRENT_DESKTOP|DESKTOP_SESSION)', '^(plasmashell|kinfo)\b', '^printenv\s+XDG_CURRENT_DESKTOP']
+prompt = "am I on wayland or x11"
+accept = ['^(echo|printf)\s.*\$\{?XDG_SESSION_TYPE', '^printenv\s+XDG_SESSION_TYPE', '^loginctl\b.*\bType\b']
 tier = "read_only"
-example = "echo $XDG_CURRENT_DESKTOP"
+example = "echo $XDG_SESSION_TYPE"
 
 # --------------------------------------------------------- writing files -----
 [[task]]

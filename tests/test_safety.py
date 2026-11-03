@@ -217,10 +217,48 @@ def test_heredoc_head_is_still_checked(ai):
     assert ai.assess(cmd)[0] == "blocked"
 
 
-@pytest.mark.xfail(reason="pipeline splitting isn't quote-aware, so a | inside quotes "
-                          "causes an unnecessary prompt (safe direction)", strict=True)
-def test_pipe_inside_quotes_is_read_only(ai):
-    assert ai.assess("sed -E 's|/usr|/opt|g' paths.txt")[0] == "read_only"
+# Operators inside quotes are text, not shell syntax. Found by the eval: the model's
+# nvidia-smi | grep -E "Temperature|GPU Name" asked permission because the quoted |
+# was treated as a pipe.
+QUOTED_OPERATORS_READ_ONLY = [
+    'nvidia-smi | grep -E "Temperature|GPU Name"',
+    "sed -E 's|/usr|/opt|g' paths.txt",
+    'grep ">" notes.txt',
+    'grep "a\\"|b" f',
+    "echo 'x | rm -rf ~'",
+    "ls -la | grep 'x;y' && df -h",
+    "df -h | awk '{print $5}'",
+]
+
+QUOTED_OPERATORS_STILL_CHECKED = [
+    'echo "x" > f',                      # the > is outside the quotes
+    'echo "x"; rm f',
+    'echo "$(rm x)"',                    # $( runs even inside double quotes
+    'grep "a|b f',                       # unclosed quote: refuse to guess
+    "awk '{print $1 > \"out\"}' f",      # awk writes a file from inside its program
+    "awk '{print | \"sh\"}' f",          # awk pipes to a shell
+    "awk 'BEGIN { \"id\" | getline x }'",  # awk runs a command
+]
+
+
+@pytest.mark.parametrize("cmd", QUOTED_OPERATORS_READ_ONLY)
+def test_operators_inside_quotes_are_not_shell_syntax(ai, cmd):
+    assert ai.assess(cmd)[0] == "read_only"
+
+
+@pytest.mark.parametrize("cmd", QUOTED_OPERATORS_STILL_CHECKED)
+def test_quote_handling_does_not_open_bypasses(ai, cmd):
+    assert ai.assess(cmd)[0] != "read_only"
+
+
+@pytest.mark.parametrize("cmd,expected", [
+    ('a | b "c|d" ; e', ["a", 'b "c|d"', "e"]),
+    ("x && y || z & w", ["x", "y", "z", "w"]),
+    ("grep 'a;b' f\nls", ["grep 'a;b' f", "ls"]),
+    ('echo \\| x', ["echo \\| x"]),     # escaped pipe is literal
+])
+def test_split_segments(ai, cmd, expected):
+    assert ai.split_segments(cmd) == expected
 
 
 def test_every_blocked_rule_is_exercised(ai):
