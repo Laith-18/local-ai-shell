@@ -130,6 +130,9 @@ BLOCKED = [
     (r">\s*/dev/(sd|nvme|vd|hd)", "would overwrite a disk"),
     (r":\(\)\s*\{.*\};\s*:", "is a fork bomb that would freeze the machine"),
     (r"\bchmod\s+(-R\s+)?0?777\s+/(\s|$)", "would make the whole system world-writable"),
+    (r"\brm\s+.*-\w*[rR]\w*.*\s/(bin|boot|dev|etc|home|lib|lib64|opt|proc|root|sbin|srv|sys|usr|var)"
+     r"/?(\s|;|&|$)", "would delete a core system folder"),
+    (r"\brm\s+.*-\w*[rR]\w*.*\s/home/[^/\s;&|]+/?(\s|;|&|$)", "would delete someone's whole home folder"),
 ]
 
 # Shown as extra detail on the permission prompt. strong=True means type 'yes'.
@@ -184,10 +187,28 @@ FORBIDDEN_FLAGS = {
     "find": {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"},
     "sort": {"-o", "--output"},
     "journalctl": {"--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush",
-                   "--sync", "--relinquish-var", "--setup-keys"},
+                   "--sync", "--relinquish-var", "--setup-keys", "--update-catalog"},
     "dmesg": {"-c", "-C", "-D", "-E", "--clear", "--read-clear"},
     "date": {"-s", "--set"},
+    "git": {"--output", "--ext-diff"},                 # writes a file / runs a diff program
+    "rg": {"--pre"},                                 # runs a program on every file
+    "tree": {"-o"},                                    # writes its output to a file
+    "ss": {"-K", "--kill"},                            # kills sockets
+    "awk": {"-i", "--include", "-l", "--load", "-f", "--file"},  # gawk -i inplace edits files
+    "nvidia-smi": {"-pl", "--power-limit", "-r", "--gpu-reset", "-pm", "--persistence-mode",
+                   "-c", "--compute-mode", "-e", "--ecc-config", "-ac", "--applications-clocks",
+                   "-rac", "--reset-applications-clocks", "-lgc", "--lock-gpu-clocks", "-rgc",
+                   "--reset-gpu-clocks", "-lmc", "--lock-memory-clocks", "-rmc",
+                   "--reset-memory-clocks", "-am", "--accounting-mode", "-caa",
+                   "--clear-accounted-apps", "-mig", "--multi-instance-gpu"},
 }
+# Single-letter options that must not appear anywhere in a bundle like -nro or -tK.
+FORBIDDEN_SHORT_LETTERS = {"sort": "o", "ss": "K"}
+# Options that take a value, so the next word isn't a file name (used for uniq).
+UNIQ_VALUE_FLAGS = {"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"}
+# GNU sed: s///e and the e command run shell commands; w/W write files.
+SED_SUBST_RE = re.compile(r"""[sy]([^\\\n])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1([A-Za-z0-9]*)""")
+SED_ADDRESS_RE = re.compile(r"/(?:\\.|[^/\\])*/|\\(.)(?:\\.|(?!\1).)*\1")
 IP_WRITE_WORDS = {"set", "add", "del", "delete", "flush", "change", "replace", "append"}
 
 # Full-screen programs: run attached to the terminal, nothing to summarise.
@@ -195,7 +216,7 @@ INTERACTIVE = {"clear", "reset", "top", "htop", "btop", "nvtop", "less", "more",
                "nvim", "ssh", "ncdu", "watch", "tmux", "screen"}
 
 SEGMENT_SPLIT = re.compile(r"\|\||&&|[|;&\n]")
-SAFE_REDIRECTS = re.compile(r"\d?>\s*/dev/null|&>\s*/dev/null|\d?>&\d")
+SAFE_REDIRECTS = re.compile(r"(?:\d?>|&>)\s*/dev/null(?![\w/.-])|\d?>&\d")
 
 
 def tokens_for(segment):
@@ -210,6 +231,40 @@ def tokens_for(segment):
     return tokens
 
 
+def sed_is_read_only(args):
+    """True if a sed invocation can't edit, write or execute anything."""
+    scripts, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-i") or a.startswith("--in-place") or a in ("-f", "--file") \
+                or a.startswith("--file="):
+            return False  # edits in place, or runs a script file we can't inspect
+        if a in ("-l", "--line-length"):
+            i += 2  # takes a number, which isn't the script
+            continue
+        if a in ("-e", "--expression"):
+            if i + 1 >= len(args):
+                return False
+            scripts.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--expression="):
+            scripts.append(a.split("=", 1)[1])
+        elif a.startswith("-e") and len(a) > 2:
+            scripts.append(a[2:])
+        elif not a.startswith("-") and not scripts:
+            scripts.append(a)  # first plain argument is the script; the rest are files
+        i += 1
+    for script in scripts:
+        for match in SED_SUBST_RE.finditer(script):
+            if set(match.group(2)) & set("ewW"):
+                return False
+        rest = SED_ADDRESS_RE.sub("", SED_SUBST_RE.sub("", script))
+        if set(rest) & set("ewW"):
+            return False  # e = execute, w/W = write a file
+    return True
+
+
 def segment_is_read_only(segment):
     try:
         tokens = tokens_for(segment)
@@ -221,16 +276,36 @@ def segment_is_read_only(segment):
 
     if name == "ip":
         return not any(a in IP_WRITE_WORDS for a in args)
-    if name in READ_ONLY_SUBCOMMANDS:
-        sub = next((a for a in args if not a.startswith("-")), None)
-        return sub in READ_ONLY_SUBCOMMANDS[name]
-    if name not in READ_ONLY_COMMANDS:
+    if name not in READ_ONLY_COMMANDS and name not in READ_ONLY_SUBCOMMANDS:
         return False
 
     for flag in FORBIDDEN_FLAGS.get(name, ()):
-        if any(a == flag or a.startswith(flag + "=") for a in args):
+        # "-o file", "--output=file", and the attached short form "-ofile"
+        short_attached = len(flag) == 2 and flag[1] != "-"
+        if any(a == flag or a.startswith(flag + "=") or (short_attached and a.startswith(flag))
+               for a in args):
             return False
-    if name == "sed" and any(a.startswith("-i") or a == "--in-place" for a in args):
+    letters = FORBIDDEN_SHORT_LETTERS.get(name, "")
+    if letters and any(a.startswith("-") and not a.startswith("--") and set(letters) & set(a[1:])
+                       for a in args):
+        return False
+    if name in READ_ONLY_SUBCOMMANDS:
+        sub = next((a for a in args if not a.startswith("-")), None)
+        return sub in READ_ONLY_SUBCOMMANDS[name]
+    if name == "env":
+        return all(a in ("-0", "--null") for a in args)  # 'env CMD' runs CMD
+    if name == "uniq":
+        files, skip = [], False
+        for a in args:
+            if skip:
+                skip = False
+            elif a in UNIQ_VALUE_FLAGS:
+                skip = True
+            elif not a.startswith("-") or a == "-":
+                files.append(a)
+        if len(files) > 1:
+            return False  # 'uniq IN OUT' overwrites OUT
+    if name == "sed" and not sed_is_read_only(args):
         return False
     if name == "ping" and not any(a.startswith("-c") for a in args):
         return False  # without -c, ping never stops
