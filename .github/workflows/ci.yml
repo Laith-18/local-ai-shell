@@ -29,3 +29,5 @@ jobs:
           allow-prereleases: true
       - run: pip install pytest
       - run: pytest
+      - name: Eval harness smoke test (replays reference answers, no GPU needed)
+        run: python eval/run_eval.py --backend oracle --repeats 1 --min-accuracy 1 --out /tmp/eval > /dev/null

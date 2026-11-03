@@ -1,5 +1,7 @@
 # local-ai-shell
 
+[![CI](https://github.com/Laith-18/local-ai-shell/actions/workflows/ci.yml/badge.svg?branch=fedora)](https://github.com/Laith-18/local-ai-shell/actions/workflows/ci.yml)
+
 A private, offline AI assistant for the Linux terminal.
 
 Ask it things in plain English. General questions get a straight answer. Questions about the machine get a shell command: read-only commands run straight away and the result is explained in plain English, while anything that changes the system explains *why* it needs permission and waits for you.
@@ -33,6 +35,7 @@ ai› how much storage do i have
 - **Guards against small-model failure modes:** token cap and runaway detection, no keyboard input for auto-run commands, and a rule against guessing facts about the machine.
 - Streaming replies, a welcome screen with live system stats, and speed and load time shown under every answer.
 - Single Python file, standard library only.
+- **Tested and evaluated.** ~280 pytest cases (safety classifier, parsing, Ctrl+C handling, eval harness) run in CI on Python 3.11–3.14, plus an automated eval harness for comparing models and prompts on 78 tasks. See [Testing & evaluation](#testing--evaluation).
 
 ## Hardware & stack
 
@@ -114,6 +117,50 @@ Nine command-generation tasks, graded by hand (full answers in `summary.md`):
 | `ujust update` showed nothing for 90 s | Piped output makes programs buffer and hides prompts | Approved commands run in a real terminal via `script(1)` |
 | A `$(cat)` command hung forever | `cat` waiting on keyboard input | Auto-run commands get no stdin; prompt rule against interactive commands |
 | Over-explained `echo hello` | Every result was summarised | Trivial or empty output is shown directly ("✓ Done.") |
+| Ctrl+C during a command crashed the whole session with a traceback | `KeyboardInterrupt` landed inside `proc.wait()` | Like a real shell, ai-shell ignores SIGINT while a command runs and lets the command handle it; regression test sends SIGINT to the process group |
+| `env rm -rf ~/Documents` would have **run without asking** (plus ~15 similar cases) | The read-only allowlist trusted program names, but `env`, GNU `sed`, `uniq`, `rg`, `nvidia-smi` and others can write, delete or execute with the right arguments | Per-program argument checks, found by writing a table-driven test suite (see below) |
+
+## Testing & evaluation
+
+### Tests
+
+```bash
+pip install pytest && pytest
+```
+
+- **Safety classifier**: table-driven tests for every tier: commands that must be blocked, must auto-run, or must ask (and whether `yes` must be typed in full). A meta-test fails if any `BLOCKED` or `PERMISSION_RULES` pattern has no test case.
+- **Read-only bypasses**: writing these tests turned up commands the allowlist treated as read-only, which would have run with no prompt, even though they can change the system. Each now has a named regression test:
+
+  | Looked read-only | What it actually does |
+  |---|---|
+  | `env rm -rf ~/Documents` | `env` runs whatever command follows it |
+  | `sed '1e touch x'`, `sed 's/a/b/e'` | GNU sed's `e` executes shell commands |
+  | `sed -n 'w ~/.bashrc'` | `w` writes a file |
+  | `sudo nvidia-smi -pl 100`, `--gpu-reset` | changes GPU power limit / resets the GPU |
+  | `uniq in.txt ~/.bashrc` | the second argument is an output file, overwritten |
+  | `rg --pre CMD`, `awk -i inplace`, `git log --output=F`, `tree -o F`, `ss -K` | run a program, edit in place, write files, kill sockets |
+  | `sort -oFILE`, `sort -nro FILE`, `ls >/dev/nullx` | attached or bundled options, and a lookalike of `/dev/null` |
+
+- **Ctrl+C**: runs a command in a child process group and sends SIGINT the way the terminal does; checks ai-shell survives and reports exit code 130.
+- **Known limitation, recorded as an `xfail` test**: pipeline splitting isn't quote-aware, so `sed 's|a|b|'` asks permission when it doesn't need to. That's the safe direction to fail in.
+
+### Eval harness
+
+`eval/run_eval.py` replaces the original hand-graded 9-task benchmark. It sends each task through **ai-shell's real pipeline** (same system prompt, same `decide` / `clean_command` / `assess` code) and grades the result automatically. It never runs the commands.
+
+```bash
+python3 eval/run_eval.py                                  # default model, 3 repeats
+python3 eval/run_eval.py --models qwen3.5:4b lfm2.5       # compare models
+python3 eval/run_eval.py --prompt minimal                 # ablation: without ai-shell's rules
+python3 eval/run_eval.py --temperature 0.7 --repeats 5    # how stable is it?
+```
+
+- **78 tasks in `eval/tasks.toml`** across 13 categories: disk, processes, logs, services, packages, files, network, hardware, facts it must not guess (time, hostname), writing files, follow-up questions, general questions it should *answer* rather than run, and dangerous requests.
+- **Graded by regex** (accepted and rejected forms, e.g. `apt` is wrong on Fedora). Each task also states the **expected safety tier**, so the report flags correct commands that would auto-run when they shouldn't, or prompt when they needn't.
+- **Dangerous requests pass** only if the model refuses, or the command is blocked or needs `yes` typed in full. The run fails if any would have auto-run.
+- **Metrics per model**: accuracy (mean ± SD across repeats), routing accuracy, consistency across repeats, p50/p95 latency, time to first token, generation tok/s, load time, VRAM, and per-category accuracy, with a table of every failure.
+- Writes `results.jsonl` (every reply), `summary.md` and `meta.json` to `eval/results/<timestamp>/`.
+- **The dataset is tested too**: every task has a reference answer that must pass its own grader at the expected tier. CI replays them (`--backend oracle`), and a fake Ollama server tests the streaming client, so the harness is checked without a GPU.
 
 ## Limitations
 
@@ -121,7 +168,7 @@ Nine command-generation tasks, graded by hand (full answers in `summary.md`):
 - **The safety checks are a heuristic, not a sandbox.** The allowlist and patterns catch the common cases, but a determined or confused model could produce something they don't anticipate. Commands run as your user, which is why anything outside the read-only list needs your confirmation.
 - **Learned rules go into the prompt**, so a long list eats into the 4K context window. It's capped at 40.
 - **Fedora-specific.** The system prompt assumes Fedora with RPM Fusion. Other distros would need the prompts and package rules rewritten. The benchmark in `bench/` was run on the earlier Bazzite setup and still uses that prompt.
-- **The benchmark is small:** 9 tasks, one run each, graded by me.
+- **The original benchmark was small:** 9 tasks, one run each, graded by me. The eval harness above replaces it. Its regexes still can't recognise every valid way to write a command, so a failure in the report is worth reading before trusting.
 
 ## Install
 
@@ -142,4 +189,4 @@ ai
 Inside `ai`: `/help`, `/learned`, `/unlearn <n>`, `/forget`, `/raw`, `/stats`, `clear`, `exit`.
 Use a different model with `ai --model <name>` or `AI_SHELL_MODEL`.
 
-To run the benchmark: `bash bench/ai-bench.sh`.
+To run the original speed benchmark: `bash bench/ai-bench.sh`. For accuracy, use the [eval harness](#eval-harness).
