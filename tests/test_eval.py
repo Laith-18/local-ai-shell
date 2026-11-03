@@ -159,6 +159,15 @@ class FakeOllama(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_GET(self):
+        if self.path != "/api/tags":
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({"models": [{"name": "fake:latest"}, {"name": "qwen3.5:4b"}]}).encode())
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeOllama.requests.append(body)
@@ -212,3 +221,39 @@ def test_full_run_against_fake_ollama(ev, fake_ollama, tmp_path, capsys):
     rows = [json.loads(line) for line in (tmp_path / "results.jsonl").read_text().splitlines()]
     assert rows[0]["task"] == "disk-free" and rows[0]["passed"]  # 'df -h' is right for that one
     assert not all(r["passed"] for r in rows)                    # but not for every disk task
+
+
+def test_missing_model_fails_fast_instead_of_scoring_zero(ev, fake_ollama, tmp_path, capsys):
+    code = ev.main(["--url", fake_ollama, "--models", "fake", "lfm2.5", "--out", str(tmp_path)])
+    assert code == 2
+    assert "ollama pull lfm2.5" in capsys.readouterr().err
+    assert not FakeOllama.requests  # nothing was sent to the model
+
+
+def test_installed_model_names_match_with_or_without_latest(ev, fake_ollama):
+    backend = ev.OllamaBackend(fake_ollama)
+    assert backend.missing_models(["fake", "fake:latest", "qwen3.5:4b", "nope"]) == ["nope"]
+
+
+def test_unreachable_ollama_fails_fast(ev, tmp_path, capsys):
+    code = ev.main(["--url", "http://127.0.0.1:9", "--out", str(tmp_path)])
+    assert code == 2
+    assert "Can't reach Ollama" in capsys.readouterr().err
+
+
+def test_regrade_rescores_saved_replies_without_a_model(ev, tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    assert ev.main(["--backend", "oracle", "--repeats", "1", "--category", "disk", "--out", str(run_dir)]) == 0
+    rows = [json.loads(line) for line in (run_dir / "results.jsonl").read_text().splitlines()]
+    # Pretend the model gave a wrong answer, and a task was later removed from the dataset.
+    rows[0].update(reply="$ sudo apt install htop", passed=True)
+    rows.append({**rows[1], "task": "deleted-task"})
+    (run_dir / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    out = tmp_path / "regraded"
+    ev.main(["--regrade", str(run_dir), "--out", str(out)])
+    regraded = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+    assert len(regraded) == len(rows) - 1          # removed task dropped
+    assert regraded[0]["passed"] is False           # wrong answer now scored by the current grader
+    assert all(r["passed"] for r in regraded[1:])
+    assert "regraded_from" in json.loads((out / "meta.json").read_text())

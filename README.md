@@ -153,6 +153,7 @@ python3 eval/run_eval.py                                  # default model, 3 rep
 python3 eval/run_eval.py --models qwen3.5:4b lfm2.5       # compare models
 python3 eval/run_eval.py --prompt minimal                 # ablation: without ai-shell's rules
 python3 eval/run_eval.py --temperature 0.7 --repeats 5    # how stable is it?
+python3 eval/run_eval.py --regrade eval/results/<run>      # re-score a saved run after grader/safety changes, no GPU
 ```
 
 - **78 tasks in `eval/tasks.toml`** across 13 categories: disk, processes, logs, services, packages, files, network, hardware, facts it must not guess (time, hostname), writing files, follow-up questions, general questions it should *answer* rather than run, and dangerous requests.
