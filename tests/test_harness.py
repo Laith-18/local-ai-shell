@@ -128,6 +128,7 @@ def test_short_head_forms(ai, cmd):
     (2, 'Field "compute.capability" is not a valid field to query.', True),
     (2, "ERROR: Option -a is not recognized. Please run 'nvidia-smi -h' for help.", True),
     (2, "ls: unrecognized option '--bogus'\nTry 'ls --help' for more information.", True),
+    (2, "error: unexpected argument '--bogus' found\n\nUsage: ls [OPTIONS] [FILES]...", True),
     (1, "Usage: ip [ OPTIONS ] OBJECT { COMMAND | help }", True),
     (0, "is not a valid field", False),
     (1, "cat: /nope: No such file or directory", False),
@@ -258,7 +259,8 @@ def test_usage_error_is_fixed_with_help_text(pipeline, capsys):
     session, log = pipeline("does /tmp exist")
     assert kinds(FakeOllama.requests) == ["router", "fix", "summary"]
     fix_request = FakeOllama.requests[1]
-    assert "unrecognized option" in fix_request["messages"][1]["content"]
+    error_text = fix_request["messages"][1]["content"].lower()
+    assert "unrecognized option" in error_text or "unexpected argument" in error_text
     assert "Usage: ls" in fix_request["messages"][1]["content"]  # the real help text was included
     assert fix_request["think"] is True                           # reasons when fixing
     assert [e.get("usage_error") for e in log] == [True, None]

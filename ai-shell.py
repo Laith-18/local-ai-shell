@@ -1129,7 +1129,7 @@ def without_short_head(cmd, output):
 
 USAGE_ERROR_RE = re.compile(
     r"not a valid field|is not valid|not recognized|unrecognized option|unrecognised option|"
-    r"invalid option|unknown option|illegal option|invalid argument|unknown command|"
+    r"invalid option|unknown option|illegal option|invalid argument|unexpected argument|unknown command|"
     r"option requires an argument|invalid field|^usage:", re.I | re.M)
 
 
