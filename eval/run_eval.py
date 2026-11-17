@@ -19,6 +19,7 @@ Usage:
   python3 eval/run_eval.py --temperature 0.7 --repeats 5   # stress consistency
   python3 eval/run_eval.py --category services packages --limit 5
   python3 eval/run_eval.py --backend oracle             # replay reference answers (no GPU, used in CI)
+  python3 eval/run_eval.py --models qwen3.5:4b qwen3.5:9b --think   # bigger model, reasoning on
 
 Writes eval/results/<timestamp>/{results.jsonl,summary.md,meta.json}.
 Standard library only.
@@ -45,8 +46,22 @@ ROOT = Path(__file__).resolve().parent.parent
 TASKS_FILE = Path(__file__).resolve().parent / "tasks.toml"
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
-# A fixed context line, so results don't depend on who runs the eval or from where.
+# A fixed context line and fixed machine facts, so results don't depend on who runs the
+# eval or on which machine. They describe fedora-box; the motherboard is a placeholder,
+# so swap in the real values from /facts in ai-shell if you like.
 FIXED_CONTEXT = "user=laith, host=fedora-box, cwd=/home/laith, home=/home/laith"
+FIXED_FACTS = {
+    "os": "Fedora Linux 44 (KDE Plasma Desktop Edition), kernel 6.19.4-200.fc44.x86_64",
+    "cpu": "Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz (6 threads)",
+    "ram": "16.7 GB",
+    "gpus": ["NVIDIA GeForce RTX 2060, 6.0 GB VRAM. The NVIDIA driver 620.70.06 is installed and working "
+             "(nvidia-smi works)"],
+    "board": "ASUSTeK COMPUTER INC. PRIME B365M-A",
+    "online": True,
+    "installed": ["htop", "btop", "fastfetch", "tmux", "jq", "podman", "flatpak", "sensors", "dmidecode",
+                  "nmcli", "lspci", "lsusb", "curl", "wget", "git", "python3", "ollama", "sunshine"],
+    "not_installed": ["nvtop", "neofetch", "screen", "fzf", "bat", "ripgrep", "inxi"],
+}
 
 MINIMAL_PROMPT = (
     "You are a Linux terminal assistant. If the request needs information from this computer or "
@@ -81,14 +96,15 @@ def load_tasks(path=TASKS_FILE):
             raise ValueError(f"{tid}: command tasks need at least one accept regex")
         if "tier" in t and t["tier"] not in TIERS:
             raise ValueError(f"{tid}: tier must be one of {sorted(TIERS)}")
-        for pattern in [*t.get("accept", []), *t.get("reject", []), t.get("contains", "")]:
+        for pattern in [*t.get("accept", []), *t.get("reject", []), t.get("contains", ""), t.get("answer_ok", "")]:
             re.compile(pattern)
     return tasks
 
 
 def build_messages(ai, model, task, prompt_style="full"):
     if prompt_style == "full":
-        system = ai.ROUTER_PROMPT.format(context=FIXED_CONTEXT, model=model, memories="(nothing yet)")
+        system = ai.ROUTER_PROMPT.format(context=FIXED_CONTEXT, model=model, memories="(nothing yet)",
+                                         facts=ai.format_facts(FIXED_FACTS), fedora_rules=ai.FEDORA_RULES)
     else:
         system = MINIMAL_PROMPT
     messages = [{"role": "system", "content": system}]
@@ -114,11 +130,13 @@ class Reply:
 class OllamaBackend:
     name = "ollama"
 
-    def __init__(self, url, temperature=0.0, num_predict=900, keep_alive="5m"):
+    def __init__(self, url, temperature=0.0, num_predict=900, keep_alive="5m", think=False, num_ctx=8192):
         self.url = url.rstrip("/")
         self.temperature = temperature
         self.num_predict = num_predict
         self.keep_alive = keep_alive
+        self.think = think
+        self.num_ctx = num_ctx
 
     def _post(self, path, payload, timeout=600):
         req = urllib.request.Request(f"{self.url}{path}", data=json.dumps(payload).encode(),
@@ -127,11 +145,12 @@ class OllamaBackend:
 
     def chat(self, model, messages, seed=0):
         payload = {
-            "model": model, "messages": messages, "stream": True, "think": False,
+            "model": model, "messages": messages, "stream": True, "think": self.think,
             "keep_alive": self.keep_alive,
             # Same options as ai-shell, plus a seed so repeats at temperature > 0 differ predictably.
-            "options": {"temperature": self.temperature, "num_predict": self.num_predict,
-                        "repeat_penalty": 1.1, "seed": seed},
+            "options": {"temperature": self.temperature,
+                        "num_predict": self.num_predict + (3000 if self.think else 0),
+                        "repeat_penalty": 1.1, "seed": seed, "num_ctx": self.num_ctx},
         }
         start = time.perf_counter()
         try:
@@ -232,6 +251,8 @@ def grade(ai, task, text):
             result["why"] = "ran a command for a general question"
         elif task.get("contains") and not re.search(task["contains"], text):
             result["why"] = "answer missing expected content"
+        elif any(re.search(p, text) for p in task.get("reject", [])):
+            result["why"] = "answer contains something it shouldn't (e.g. a repeated suggestion)"
         else:
             result["passed"] = True
         return result
@@ -246,7 +267,12 @@ def grade(ai, task, text):
 
     # kind == "command"
     if route != "command":
-        result["why"] = "answered in English instead of running a command"
+        # Some questions are answered by the verified machine facts in the prompt, so a
+        # correct plain-English answer is as good as running the command.
+        if task.get("answer_ok") and re.search(task["answer_ok"], text):
+            result["passed"] = True
+        else:
+            result["why"] = "answered in English instead of running a command"
         return result
     cmd = result["command"]
     if not any(re.search(p, cmd) for p in task["accept"]):
@@ -420,6 +446,8 @@ def main(argv=None):
     parser.add_argument("--category", nargs="+", help="only run these categories")
     parser.add_argument("--limit", type=int, help="only the first N tasks (after filtering)")
     parser.add_argument("--backend", choices=["ollama", "oracle"], default="ollama")
+    parser.add_argument("--think", action="store_true", help="let the model reason first (ai-shell's /think on)")
+    parser.add_argument("--num-ctx", type=int, default=ai.NUM_CTX, help="context window, as in ai-shell")
     parser.add_argument("--url", default=ai.OLLAMA_URL)
     parser.add_argument("--out", type=Path, help="output folder (default eval/results/<timestamp>)")
     parser.add_argument("--min-accuracy", type=float, default=None,
@@ -456,7 +484,8 @@ def main(argv=None):
         (out / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
         return finish(rows, meta, out, args)
 
-    backend = OracleBackend(tasks) if args.backend == "oracle" else OllamaBackend(args.url, args.temperature)
+    backend = OracleBackend(tasks) if args.backend == "oracle" else OllamaBackend(
+        args.url, args.temperature, think=args.think, num_ctx=args.num_ctx)
     # Fail fast, rather than recording hundreds of errors as a 0% score.
     try:
         missing = backend.missing_models(args.models)
@@ -472,6 +501,7 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     meta = {"started": started.isoformat(timespec="seconds"), "models": args.models, "tasks": len(tasks),
             "repeats": args.repeats, "temperature": args.temperature, "prompt_style": args.prompt_style,
+            "think": args.think, "num_ctx": args.num_ctx,
             "backend": backend.name, "host": f"{platform.node()} · {platform.platform()}",
             "python": platform.python_version()}
 

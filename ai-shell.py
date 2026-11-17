@@ -23,8 +23,10 @@ import contextlib
 import getpass
 import json
 import os
+import platform
 import random
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -60,33 +62,69 @@ MEMORY_FILE = DATA_DIR / "memory.json"
 MAX_MEMORIES = 40
 OUTPUT_PREVIEW_LINES = 15    # lines of raw output shown for read-only commands
 SUMMARY_INPUT_CHARS = 4000   # how much command output the model gets to read
-HISTORY_MESSAGES = 6         # remembered messages for follow-up questions
+HISTORY_MESSAGES = 10        # remembered messages for follow-up questions
+NUM_CTX = int(os.environ.get("AI_SHELL_NUM_CTX", "8192"))  # context window; Ollama's default is smaller
+THINK_MODES = ("off", "auto", "on")
+DEFAULT_THINK = os.environ.get("AI_SHELL_THINK", "auto")
+THINK_TOKENS = 3000          # extra token budget when the model reasons before answering
+HELP_TEXT_CHARS = 2500       # how much --help output the model gets when fixing a command
+PASTE_WINDOW = 0.05          # seconds: lines arriving this close together are one paste
 
 # ------------------------------------------------------------------ prompts --
+# Shared by every prompt in the pipeline, so the summary step never contradicts the router.
+FEDORA_RULES = """Fedora facts:
+- Software is installed with dnf (never yum, apt or rpm-ostree). RPM Fusion is enabled.
+- In dnf, "update" is just another name for "upgrade". --refresh makes dnf re-download the package lists first. Update everything with: sudo dnf upgrade --refresh
+- "dnf check-upgrade" exits with code 100 when updates are available; that is not an error.
+- Logs come from journalctl; there is no /var/log/syslog.
+- / and /home are btrfs subvolumes on the same partition, so count that space once. Ignore tmpfs, efivarfs and zram entries."""
+
 ROUTER_PROMPT = """You are ai-shell, a friendly assistant living in a terminal on Fedora Linux with the KDE Plasma desktop.
 
 Decide what the user needs:
-- If answering needs information from this computer, or they want something done on it, reply with ONE line: "$ " followed by a single shell command. Nothing else.
-- Never guess facts about this computer, the current date or the time: always use a command (e.g. $ date).
+- If the verified facts below answer the question, answer from them directly in plain English.
+- Otherwise, if answering needs information from this computer, or they want something done on it, reply with ONE line: "$ " followed by a single shell command. Nothing else.
+- Never guess facts about this computer, the current date or the time: use the verified facts or a command (e.g. $ date).
 - If it is a general question that isn't about this machine, answer in plain English in 1-4 short sentences. No markdown.
+- If the user pastes command output, explain what it shows; don't re-run the command unless they ask.
+- If the user says they've already tried or done something, don't suggest it again: suggest different things, or say you're out of ideas.
 
-About you: you are the {model} model, running entirely on this computer's own GPU through Ollama. You need no internet connection and nothing leaves the machine. You usually write around 60-70 tokens per second; the first reply after a break takes a few seconds longer while the model loads. You are far smaller and less capable than big cloud chatbots like Claude or ChatGPT, but you are private, free and work offline. Each reply shows its timing underneath, so for speed questions point to that rather than running a test.
+About you: you are the {model} model, running entirely on this computer's own GPU through Ollama, so nothing the user asks leaves the machine (the computer itself can still be online: see the facts). The first reply after a break takes a few seconds longer while the model loads. You are far smaller and less capable than big cloud chatbots like Claude or ChatGPT, but you are private and free. Each reply shows its speed underneath. That speed is normal for a local model of your size on this GPU: it is set mainly by the model's size and the GPU's memory bandwidth. Don't invent other explanations, and don't make claims about how fast other AI services are.
+
+{facts}
 
 Command rules:
 - Do exactly what was asked; don't chain extra commands or add unneeded flags.
+- Don't pipe into head or tail unless the user asks for a top N or the last N lines; ai-shell already shortens long output.
+- Only use programs listed as installed, or common core tools. Never invent programs or options.
 - Never use commands that wait for keyboard input, such as cat with no file.
 - To write a file, use a heredoc: the first line is $ cat > /path/to/file << 'EOF' then the file's
   content on the following lines, then EOF alone on the last line. This is the only time you may
   reply with more than one line.
-- Install software with dnf, e.g. $ sudo dnf install htop  (never yum, apt or rpm-ostree). RPM Fusion is enabled.
+- Install software with dnf, e.g. $ sudo dnf install htop
 - GUI apps can also come from Flathub, e.g. $ flatpak install flathub discord
-- Update the whole system with: $ sudo dnf upgrade --refresh
 - Never remove the NVIDIA driver (akmod-nvidia) or kernel packages unless the user asks for exactly that.
 - Containers use podman, not docker.
 - Sunshine runs as a systemd user service named exactly "sunshine": manage it with systemctl --user <action> sunshine
 - Ollama runs as a system service named "ollama": manage it with sudo systemctl <action> ollama
-- Logs come from journalctl; there is no /var/log/syslog.
 - Only use sudo when actually required.
+
+{fedora_rules}
+
+Known-good commands. When one fits the request, use it exactly:
+- GPU load, VRAM, temperature, power: $ nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv
+- What is using the GPU: $ nvidia-smi
+- Motherboard model: $ cat /sys/class/dmi/id/board_vendor /sys/class/dmi/id/board_name
+- BIOS version: $ cat /sys/class/dmi/id/bios_vendor /sys/class/dmi/id/bios_version /sys/class/dmi/id/bios_date
+- CPU details: $ lscpu
+- RAM sticks, speed and slots: $ sudo dmidecode -t memory
+- IP addresses: $ ip -brief address
+- Are updates available: $ dnf check-upgrade
+- Failed services: $ systemctl --failed
+- Errors since boot: $ journalctl -b -p err --no-pager
+- Temperatures: $ sensors
+- Local AI models: $ ollama list   (loaded right now: $ ollama ps)
+- Is the internet working right now: $ ping -c 3 1.1.1.1
 
 Things the user has taught you. Always follow these; they override everything above:
 {memories}
@@ -96,10 +134,20 @@ Context: {context}"""
 SUMMARY_PROMPT = """You are ai-shell on Fedora Linux (KDE Plasma). You ran a command for the user; now explain the result.
 Answer their original question directly in plain English, in 1-3 short sentences, using specific numbers and names from the output. No markdown, and don't restate the command.
 If the output already answers the question, just say it naturally in one short sentence.
-If the command failed, say what went wrong and suggest a fix in one sentence.
+If the command failed, say what went wrong and suggest a fix in one sentence. Only suggest programs and options you are sure exist.
 If the output is empty, say so plainly; never claim something worked unless the output shows it.
-Software is installed with dnf (never apt or rpm-ostree). Updates are done with: sudo dnf upgrade --refresh
-Fedora quirks: / and /home are btrfs subvolumes on the same partition, so count that space once. Ignore tmpfs, efivarfs and zram entries."""
+If the output is only column headings with no values, say the command returned no data. Never conclude from that alone that hardware, drivers or software are missing: the verified facts below are true.
+
+{facts}
+
+{fedora_rules}"""
+
+FIX_PROMPT = """You are ai-shell on Fedora Linux. A command you suggested failed with a usage error (a wrong option or field name).
+Using the error and the help text, reply with ONE line: "$ " followed by a corrected command that answers the user's question. Nothing else.
+Use only options and field names that appear in the help text. Don't add head or tail.
+If this program can't do it, use a different installed program instead.
+
+{facts}"""
 
 EXPLAIN_PROMPT = """In one short sentence for a non-expert, say what this Linux command will change on the computer. Start with a verb. No markdown."""
 
@@ -410,12 +458,18 @@ def get_json(path, timeout=1.5):
         return json.load(resp)
 
 
-def chat_stream(model, messages, keep_alive, num_predict):
-    """Yield (text_piece, final_stats_or_None) as the model generates."""
+def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinking=None):
+    """Yield (text_piece, final_stats_or_None) as the model generates.
+
+    With think=True the model reasons first. Ollama sends that reasoning separately
+    (message.thinking), so it never reaches the reply text; on_thinking() is called
+    while it happens so the spinner can say so.
+    """
     payload = {
-        "model": model, "messages": messages, "stream": True, "think": False,
+        "model": model, "messages": messages, "stream": True, "think": think,
         "keep_alive": keep_alive,
-        "options": {"temperature": 0, "num_predict": num_predict, "repeat_penalty": 1.1},
+        "options": {"temperature": 0, "num_predict": num_predict + (THINK_TOKENS if think else 0),
+                    "repeat_penalty": 1.1, "num_ctx": NUM_CTX},
     }
     try:
         resp = _post("/api/chat", payload)
@@ -432,16 +486,19 @@ def chat_stream(model, messages, keep_alive, num_predict):
             data = json.loads(raw)
             if data.get("error"):
                 raise OllamaError(data["error"])
-            piece = (data.get("message") or {}).get("content") or ""
+            message = data.get("message") or {}
+            piece = message.get("content") or ""
+            if message.get("thinking") and on_thinking:
+                on_thinking()
             if data.get("done"):
                 yield piece, data
                 return
             yield piece, None
 
 
-def chat(model, messages, keep_alive, num_predict):
+def chat(model, messages, keep_alive, num_predict, think=False):
     text, final = "", {}
-    for piece, done in chat_stream(model, messages, keep_alive, num_predict):
+    for piece, done in chat_stream(model, messages, keep_alive, num_predict, think):
         text += piece
         final = done or final
     return text, final
@@ -462,8 +519,12 @@ class Spinner:
 
     def __init__(self, text):
         self.text = text
+        self.thinking = False  # set once the model starts reasoning, so a pause isn't blamed on loading
         self._stop = threading.Event()
         self._thread = None
+
+    def mark_thinking(self):
+        self.thinking = True
 
     def start(self):
         if TTY:
@@ -475,7 +536,10 @@ class Spinner:
         start, i = time.monotonic(), 0
         while not self._stop.wait(0.1):
             elapsed = time.monotonic() - start
-            text = self.text if elapsed < 3 else "loading the model (slower after a break)"
+            if self.thinking:
+                text = "thinking it through"
+            else:
+                text = self.text if elapsed < 3 else "loading the model (slower after a break)"
             sys.stdout.write(f"\r  {paint(self.FRAMES[i % len(self.FRAMES)], MAGENTA)} "
                              f"{paint(f'{text}… {elapsed:.0f}s', DIM)}\033[K")
             sys.stdout.flush()
@@ -523,11 +587,13 @@ class Streamer:
             print()
 
 
-def footer(seconds, load_seconds, final=None):
+def footer(seconds, load_seconds, final=None, thought=False):
     parts = [f"{seconds:.1f}s"]
     final = final or {}
     if final.get("eval_duration") and (final.get("eval_count") or 0) >= 5:
         parts.append(f"{final['eval_count'] / (final['eval_duration'] / 1e9):.0f} tok/s")
+    if thought:
+        parts.append("thought it through first")
     if load_seconds > 1.5:
         parts.append(f"{load_seconds:.1f}s of that was loading the model")
     print(paint("    (" + " · ".join(parts) + ")", DIM))
@@ -537,6 +603,135 @@ def offline_message(err):
     reason = getattr(err, "reason", err)
     print(f"\n  {paint('Can’t reach the AI', RED, BOLD)} at {OLLAMA_URL} ({reason}).")
     print(paint("  Start it with: sudo systemctl start ollama", DIM))
+
+
+# --------------------------------------------------------- machine facts -----
+# Checked once per session and put in every prompt, so the model doesn't have to guess
+# (it used to claim the NVIDIA driver was missing, or that the machine was offline).
+NOTABLE_TOOLS = ["htop", "btop", "nvtop", "fastfetch", "neofetch", "tmux", "screen", "fzf", "bat", "jq",
+                 "ripgrep:rg", "podman", "flatpak", "sensors", "dmidecode", "nmcli", "lspci", "lsusb",
+                 "inxi", "curl", "wget", "git", "python3", "ollama", "sunshine"]
+DMI = Path("/sys/class/dmi/id")
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def os_release():
+    for line in read_text("/etc/os-release").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return platform.system()
+
+
+def cpu_model():
+    for line in read_text("/proc/cpuinfo").splitlines():
+        if line.lower().startswith("model name"):
+            return re.sub(r"\s+", " ", line.split(":", 1)[1]).strip()
+    return platform.processor() or "unknown"
+
+
+def ram_total_gb():
+    match = re.search(r"MemTotal:\s+(\d+)", read_text("/proc/meminfo"))
+    return round(int(match.group(1)) * 1024 / 1e9, 1) if match else None
+
+
+def run_quiet(argv, timeout=3):
+    """Run a fixed, harmless command and return its stdout, or '' if anything goes wrong."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def gpu_facts():
+    if shutil.which("nvidia-smi"):
+        out = run_quiet(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+                         "--format=csv,noheader,nounits"])
+        gpus = []
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 3 and parts[1].isdigit():
+                gpus.append(f"{parts[0]}, {int(parts[1]) / 1024:.1f} GB VRAM. The NVIDIA driver "
+                            f"{parts[2]} is installed and working (nvidia-smi works)")
+        if gpus:
+            return gpus
+    out = run_quiet(["lspci"]) if shutil.which("lspci") else ""
+    return [re.sub(r"^\S+\s+[^:]+:\s*", "", line) for line in out.splitlines()
+            if re.search(r"VGA|3D controller|Display controller", line)]
+
+
+def board():
+    vendor, name = read_text(DMI / "board_vendor"), read_text(DMI / "board_name")
+    text = " ".join(x for x in (vendor, name) if x)
+    product = " ".join(x for x in (read_text(DMI / "sys_vendor"), read_text(DMI / "product_name"))
+                       if x and "o.e.m" not in x.lower() and "to be filled" not in x.lower())
+    if product and product != text:
+        text = f"{text} (system: {product})" if text else product
+    return text
+
+
+def is_online(timeout=0.6):
+    for host in ("1.1.1.1", "8.8.8.8"):
+        try:
+            socket.create_connection((host, 53), timeout=timeout).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def installed_tools():
+    have, missing = [], []
+    for entry in NOTABLE_TOOLS:
+        label, _, binary = entry.partition(":")
+        (have if shutil.which(binary or label) else missing).append(label)
+    return have, missing
+
+
+def machine_facts():
+    """Facts about this computer that don't change during a session."""
+    have, missing = installed_tools()
+    ram = ram_total_gb()
+    return {
+        "os": f"{os_release()}, kernel {platform.release()}",
+        "cpu": f"{cpu_model()} ({os.cpu_count()} threads)",
+        "ram": f"{ram} GB" if ram else "",
+        "gpus": gpu_facts(),
+        "board": board(),
+        "online": is_online(),
+        "installed": have,
+        "not_installed": missing,
+    }
+
+
+def format_facts(facts):
+    lines = ["Verified facts about this computer (checked when ai-shell started, so they are true;"
+             " live values like usage, temperatures and free space still need a command):"]
+    if facts.get("os"):
+        lines.append(f"- OS: {facts['os']}")
+    if facts.get("cpu"):
+        lines.append(f"- CPU: {facts['cpu']}")
+    if facts.get("ram"):
+        lines.append(f"- RAM: {facts['ram']} total")
+    for gpu in facts.get("gpus") or ["none detected"]:
+        lines.append(f"- GPU: {gpu}")
+    if facts.get("board"):
+        lines.append(f"- Motherboard: {facts['board']}")
+    if "online" in facts:
+        lines.append("- Internet: " + ("this computer is online" if facts["online"]
+                                       else "this computer couldn't reach the internet at startup"))
+    if facts.get("installed"):
+        lines.append("- Installed tools: " + ", ".join(facts["installed"]))
+    if facts.get("not_installed"):
+        lines.append("- Not installed (suggest installing them, don't run them): "
+                     + ", ".join(facts["not_installed"]))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- banner -----
@@ -668,7 +863,7 @@ def banner(model):
     print_stats(model)
     tips = " · ".join(f"“{t}”" for t in random.sample(EXAMPLES, 3))
     print(f"\n  {paint('Try', DIM)}      {tips}")
-    print(f"  {paint('Commands', DIM)} /help · /learned · /forget · clear · exit")
+    print(f"  {paint('Commands', DIM)} /help · /learned · /think · /facts · clear · exit")
 
 
 HELP = """
@@ -685,21 +880,35 @@ HELP = """
     when I say "games", I mean the folder /mnt/gamedrive
   If you fix a command with e, I'll offer to remember the fix.
 
+  Paste multi-line output (e.g. an nvidia-smi table) straight in, or wrap
+  it in triple quotes: start with \"\"\" and end with \"\"\".
+
   clear       clear the screen
   /learned    list everything I've learned     /unlearn <n>   forget one
   /forget     forget this conversation          /raw           show or hide raw output
+  /think      off · auto · on (auto: reason first for "why…" and troubleshooting questions)
+  /facts      show what I know about this machine
   /stats      show the system stats again       exit           quit and free the GPU
 """
 
 
 # --------------------------------------------------------------- session -----
 class Session:
-    def __init__(self, model, keep_alive):
+    def __init__(self, model, keep_alive, think=DEFAULT_THINK):
         self.model = model
         self.keep_alive = keep_alive
+        self.think = think if think in THINK_MODES else "auto"
         self.history = []
         self.show_output = True
         self.used_model = False
+        self._facts = None
+
+    @property
+    def facts(self):
+        """Machine facts as prompt text, gathered on first use."""
+        if self._facts is None:
+            self._facts = format_facts(machine_facts())
+        return self._facts
 
     def remember(self, request, reply):
         self.history += [{"role": "user", "content": request},
@@ -859,6 +1068,96 @@ def command_head(cmd):
     return cmd.split("\n", 1)[0] if HEREDOC_RE.search(cmd.split("\n", 1)[0]) else cmd
 
 
+# ------------------------------------------------ checks around running ------
+# Words that mean the model has to reason, not just recall a command.
+DIAGNOSTIC_RE = re.compile(
+    r"\b(why|diagnos\w*|troubleshoot\w*|investigat\w*|debug\w*|inspect|figure out|find out|work out|"
+    r"root cause|reason for|what'?s wrong|what is wrong|not working|isn'?t working|broken|"
+    r"difference between|compare|should i|can i run)\b", re.I)
+
+
+def should_think(mode, request):
+    return mode == "on" or (mode == "auto" and bool(DIAGNOSTIC_RE.search(request)))
+
+
+SHELL_WORDS = {"cd", "echo", "printf", "type", "test", "[", "[[", "true", "false", "export", "set", "unset",
+               "alias", "source", ".", "exit", "read", "command", "history", "pwd", "ulimit", "umask",
+               "wait", "jobs", "fg", "bg", "time", "exec", "eval", "let", "declare", "local", "for",
+               "while", "until", "if", "then", "else", "elif", "fi", "do", "done", "case", "esac",
+               "shift", "trap", "!", "{", "}", "function", "select", "builtin", "hash", "kill"}
+
+
+def missing_programs(cmd):
+    """Programs a command would run that aren't installed (catches invented ones like 'bless -t')."""
+    missing = []
+    for segment in split_segments(command_head(cmd)):
+        try:
+            tokens = tokens_for(segment)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        name = tokens[0]
+        if name in SHELL_WORDS or name[0] in "({$" or "=" in name:
+            continue
+        if "/" in name:
+            found = os.access(os.path.expanduser(name), os.X_OK)
+        else:
+            found = shutil.which(name) is not None
+        if not found and name not in missing:
+            missing.append(name)
+    return missing
+
+
+SHORT_HEAD_RE = re.compile(r"\|\s*head\s+(?:-n\s*|-)?([12])\s*$")
+
+
+def without_short_head(cmd, output):
+    """If '| head -1' (or -2) left only column headings, return the command without it.
+
+    The model likes to add '| head -1', which on most tabular output keeps just the
+    header row. It then read that as "no GPU detected". Re-reading the full output fixes it.
+    """
+    match = SHORT_HEAD_RE.search(mask_quoted(cmd))
+    if not match:
+        return None
+    kept = [ln for ln in output.splitlines() if ln.strip()]
+    if len(kept) > int(match.group(1)) or any(ch.isdigit() for ln in kept for ch in ln):
+        return None  # real data came through, so head did its job
+    return cmd[:match.start()].rstrip()
+
+
+USAGE_ERROR_RE = re.compile(
+    r"not a valid field|is not valid|not recognized|unrecognized option|unrecognised option|"
+    r"invalid option|unknown option|illegal option|invalid argument|unexpected argument|unknown command|"
+    r"option requires an argument|invalid field|^usage:", re.I | re.M)
+
+
+def is_usage_error(code, output):
+    return code not in (0, 130) and bool(USAGE_ERROR_RE.search(output))
+
+
+def help_text(cmd):
+    """Help for the failing program, so the model can pick real options. Only runs --help
+    for programs on the read-only list, and never through a shell."""
+    prog = first_program(cmd)
+    if prog == "nvidia-smi":
+        for query, helper in (("--query-gpu", "--help-query-gpu"),
+                              ("--query-compute-apps", "--help-query-compute-apps")):
+            if query in cmd:
+                fields = re.findall(r'^"([\w.]+)"', run_quiet(["nvidia-smi", helper]), re.M)
+                if fields:
+                    return f"Valid {query} fields: " + ", ".join(fields)
+    if prog in READ_ONLY_COMMANDS or prog in READ_ONLY_SUBCOMMANDS or prog in ("ip", "rpm"):
+        try:
+            done = subprocess.run([prog, "--help"], capture_output=True, text=True, timeout=3,
+                                  stdin=subprocess.DEVNULL)
+            return strip_ansi(done.stdout + done.stderr)[:HELP_TEXT_CHARS]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ""
+
+
 def show_command(cmd, note=""):
     lines = cmd.split("\n")
     print(f"\n  {paint('$', DIM)} {paint(lines[0], BOLD, CYAN)}" + (paint(note, DIM) if note else ""))
@@ -990,14 +1289,16 @@ def run_command(cmd, show_output, cap_lines, allow_input=True):
     return code, strip_ansi(b"".join(chunks).decode(errors="replace")), False
 
 
-def summarise(session, request, cmd, code, output):
+def summarise(session, request, cmd, code, output, note=""):
     if len(output) > SUMMARY_INPUT_CHARS:
         half = SUMMARY_INPUT_CHARS // 2
         output = output[:half] + "\n...[output trimmed]...\n" + output[-half:]
+    system = SUMMARY_PROMPT.format(facts=session.facts, fedora_rules=FEDORA_RULES)
     messages = [
-        {"role": "system", "content": SUMMARY_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": f"Question: {request}\nCommand: {cmd}\nExit code: {code}\n"
-                                    f"Output:\n{output.strip() or '(no output)'}"},
+                                    + (f"Note: {note}\n" if note else "")
+                                    + f"Output:\n{output.strip() or '(no output)'}"},
     ]
     spinner = Spinner("reading the output").start()
     out, text, final = Streamer(), "", {}
@@ -1017,6 +1318,42 @@ def summarise(session, request, cmd, code, output):
     return text.strip(), final
 
 
+def router_messages(session, request):
+    system = ROUTER_PROMPT.format(context=context_line(), model=session.model, memories=memories_for_prompt(),
+                                  facts=session.facts, fedora_rules=FEDORA_RULES)
+    return [{"role": "system", "content": system}, *session.history, {"role": "user", "content": request}]
+
+
+def fix_command(session, request, cmd, output):
+    """Ask the model for a corrected command after a usage error, with the help text in hand.
+
+    Returns the new command, or None if it couldn't come up with a different one.
+    """
+    helptext = help_text(cmd)
+    error = output.strip()[-1500:] or "(no output)"
+    messages = [
+        {"role": "system", "content": FIX_PROMPT.format(facts=session.facts)},
+        {"role": "user", "content": f"Question: {request}\nFailed command: {cmd}\nError:\n{error}\n\n"
+                                    f"Help text:\n{helptext or '(no help text available)'}"},
+    ]
+    think = session.think != "off"  # fixing a mistake is exactly where reasoning pays off
+    spinner = Spinner("checking the help and fixing the command").start()
+    if think:
+        spinner.mark_thinking()
+    try:
+        text, _ = chat(session.model, messages, session.keep_alive, 200, think=think)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        spinner.stop()
+    if decide(text, True) != "command":
+        return None
+    fixed = clean_command(text)
+    if not fixed or fixed == cmd or "\n" in fixed or len(fixed) > MAX_COMMAND_CHARS:
+        return None
+    return fixed
+
+
 def handle(session, request):
     rule = teaching(request)
     if rule:
@@ -1024,13 +1361,12 @@ def handle(session, request):
         log({"model": session.model, "request": request, "decision": "learned"})
         return
     start = time.monotonic()
-    messages = [{"role": "system", "content": ROUTER_PROMPT.format(context=context_line(), model=session.model,
-                                                       memories=memories_for_prompt())},
-                *session.history, {"role": "user", "content": request}]
+    think = should_think(session.think, request)
     spinner = Spinner("thinking").start()
     buffer, mode, final, out = "", None, {}, Streamer()
     try:
-        for piece, done in chat_stream(session.model, messages, session.keep_alive, MAX_REPLY_TOKENS):
+        for piece, done in chat_stream(session.model, router_messages(session, request), session.keep_alive,
+                                       MAX_REPLY_TOKENS, think=think, on_thinking=spinner.mark_thinking):
             buffer += piece
             final = done or final
             if mode is None:
@@ -1063,13 +1399,13 @@ def handle(session, request):
         out.end()
         if not out.started:
             print(paint("\n  (no reply — try rephrasing)", DIM))
-        footer(time.monotonic() - start, load_seconds, final)
+        footer(time.monotonic() - start, load_seconds, final, thought=think)
         session.remember(request, buffer.strip())
-        log({"model": session.model, "request": request, "decision": "answered"})
+        log({"model": session.model, "request": request, "decision": "answered", "think": think})
         return
 
     cmd = clean_command(buffer)
-    entry = {"model": session.model, "request": request, "command": cmd}
+    entry = {"model": session.model, "request": request, "command": cmd, "think": think}
     limit = MAX_SCRIPT_CHARS if "\n" in cmd else MAX_COMMAND_CHARS
     if not cmd or final.get("done_reason") == "length" or len(cmd) > limit:
         print(f"\n  {paint('The model got stuck', RED, BOLD)} and produced a runaway reply, "
@@ -1077,7 +1413,14 @@ def handle(session, request):
         footer(time.monotonic() - start, load_seconds)
         log({**entry, "command": cmd[:200], "decision": "runaway"})
         return
+    execute(session, request, cmd, entry, start, load_seconds, thought=think)
 
+
+def approve(session, request, cmd, entry):
+    """Safety check, installed-program check and permission prompt.
+
+    Returns (cmd, verdict) to run (cmd may have been edited), or None if nothing should run.
+    """
     while True:
         verdict, reasons, strong = assess(cmd)
         show_command(cmd, "   read-only, running it" if verdict == "read_only" else "")
@@ -1086,9 +1429,19 @@ def handle(session, request):
             print(f"  {paint('Blocked:', RED, BOLD)} this command {reasons[0]}. I won't run it.")
             session.remember(request, f"$ {cmd}\n(blocked: {reasons[0]})")
             log({**entry, "command": cmd, "decision": "blocked", "reasons": reasons})
-            return
+            return None
+        missing = missing_programs(cmd)
+        if missing:
+            names = ", ".join(missing)
+            print(f"\n  {paint('Not run:', YELLOW, BOLD)} {names} {'is' if len(missing) == 1 else 'are'} "
+                  f"not installed on this machine.")
+            print(paint(f"  If it's a real package, try: sudo dnf install {missing[0]}  "
+                        f"(or ask me for another way)", DIM))
+            session.remember(request, f"$ {cmd}\n(not run: {names} not installed)")
+            log({**entry, "command": cmd, "decision": "missing", "missing": missing})
+            return None
         if verdict == "read_only":
-            break
+            return cmd, verdict
 
         print(f"\n  {paint('Needs your permission:', YELLOW, BOLD)} {explain(session, cmd)}")
         print(paint(f"  ({' · '.join(reasons)})", DIM))
@@ -1105,15 +1458,46 @@ def handle(session, request):
                 cmd = new
             continue
         if (answer == "yes") if strong else (answer in ("y", "yes")):
-            break
+            return cmd, verdict
         print(paint("  Cancelled, nothing was run.", DIM))
         session.remember(request, f"$ {cmd}\n(user cancelled)")
         log({**entry, "command": cmd, "decision": "cancelled"})
+        return None
+
+
+def execute(session, request, cmd, entry, start, load_seconds, thought=False, attempt=0):
+    approved = approve(session, request, cmd, entry)
+    if approved is None:
+        footer(time.monotonic() - start, load_seconds, thought=thought)
         return
+    cmd, verdict = approved
 
     show = session.show_output or verdict != "read_only"
     code, output, interactive = run_command(cmd, show, cap_lines=verdict == "read_only",
                                             allow_input=verdict != "read_only")
+
+    # A wrong option or field name: give the model the real help text and one more go.
+    if not interactive and attempt == 0 and is_usage_error(code, output):
+        log({**entry, "command": cmd, "decision": "ran", "auto": verdict == "read_only",
+             "exit_code": code, "usage_error": True})
+        fixed = fix_command(session, request, cmd, output)
+        if fixed:
+            print(paint("\n  ↻ That was a usage error, so I checked the help text and tried again:", DIM))
+            execute(session, request, fixed, {**entry, "command": fixed, "retry_of": cmd,
+                                               "think": session.think != "off"},
+                    start, load_seconds, thought=True, attempt=1)
+            return
+
+    note = ""
+    if verdict == "read_only" and code == 0 and not interactive:
+        fuller = without_short_head(cmd, output)
+        if fuller and assess(fuller)[0] == "read_only":
+            _, full_output, _ = run_command(fuller, False, cap_lines=True, allow_input=False)
+            if full_output.strip():
+                output = full_output
+                note = "the command's head kept only the column headings, so this is the full output instead"
+                print(paint("    (head cut that down to just the headings, so I read the full output)", DIM))
+
     summary, summary_stats = "", {}
     meaningful = [ln for ln in output.splitlines() if ln.strip()]
     if interactive:
@@ -1127,16 +1511,69 @@ def handle(session, request):
         if not show:
             print("\n" + "\n".join(f"    {ln}" for ln in meaningful))
     else:
-        summary, summary_stats = summarise(session, request, cmd, code, output)
+        summary, summary_stats = summarise(session, request, cmd, code, output, note)
     if entry.get("edited") and code == 0:
         offer_to_learn(request, cmd)
-    footer(time.monotonic() - start, load_seconds, summary_stats)
+    footer(time.monotonic() - start, load_seconds, summary_stats, thought=thought)
     session.remember(request, f"$ {cmd}\n{summary}".strip())
     log({**entry, "command": cmd, "decision": "ran", "auto": verdict == "read_only",
          "exit_code": code, "seconds": round(time.monotonic() - start, 2)})
 
 
 # ------------------------------------------------------------------ main -----
+def stdin_has_more(timeout=PASTE_WINDOW):
+    try:
+        return bool(select.select([sys.stdin], [], [], timeout)[0])
+    except (OSError, ValueError):
+        return False
+
+
+def read_request(prompt):
+    """Read one request, keeping a multi-line paste together as one request.
+
+    - Bracketed paste (most terminals): readline hands the whole paste back at once.
+    - Terminals without it send each line as if Enter was pressed; lines that are
+      already waiting a few milliseconds later are part of the same paste.
+    - Or wrap it by hand: start with \"\"\" and end with \"\"\".
+    """
+    before = readline.get_current_history_length() if readline else 0
+    first = input(prompt)
+    if first.lstrip().startswith('"""'):
+        lines = [first.lstrip()[3:]]
+        while not lines[-1].rstrip().endswith('"""'):
+            lines.append(input(paint("  … ", DIM) if TTY else "... "))
+        lines[-1] = lines[-1].rstrip()[:-3]
+    else:
+        lines = [first]
+        while sys.stdin.isatty() and stdin_has_more():
+            try:
+                lines.append(input())
+            except EOFError:
+                break
+    text = "\n".join(lines).strip()
+    if "\n" in text and readline:
+        # One history entry for the whole paste, not one per line.
+        try:
+            while readline.get_current_history_length() > before:
+                readline.remove_history_item(readline.get_current_history_length() - 1)
+            readline.add_history(" ".join(text.split())[:500])
+        except (ValueError, IndexError):
+            pass
+    return text
+
+
+def set_think(session, arg):
+    if arg in THINK_MODES:
+        session.think = arg
+    elif arg:
+        print(paint("  Use /think off, /think auto or /think on.", DIM))
+        return
+    detail = {"off": "never reason first (fastest)",
+              "auto": "reason first for 'why…', troubleshooting and comparison questions, and when fixing a command",
+              "on": "always reason first (slower, more careful)"}[session.think]
+    print(paint(f"  Thinking is {session.think}: {detail}.", DIM))
+
+
 def interactive(session, show_banner):
     if show_banner:
         banner(session.model)
@@ -1145,11 +1582,14 @@ def interactive(session, show_banner):
             readline.read_history_file(READLINE_FILE)
         except OSError:
             pass
+        with contextlib.suppress(Exception):
+            # Python turns this off by default; on, a pasted block arrives as one line.
+            readline.parse_and_bind("set enable-bracketed-paste on")
     prompt = (paint("\nai› ", MAGENTA, BOLD)) if TTY else "\nai> "
     try:
         while True:
             try:
-                request = input(prompt).strip()
+                request = read_request(prompt)
             except KeyboardInterrupt:
                 print()
                 continue
@@ -1181,6 +1621,10 @@ def interactive(session, show_banner):
             elif command == "/stats":
                 print()
                 print_stats(session.model)
+            elif command.startswith("/think"):
+                set_think(session, command[len("/think"):].strip())
+            elif command == "/facts":
+                print("\n" + "\n".join(f"  {line}" for line in session.facts.splitlines()))
             else:
                 try:
                     handle(session, request)
@@ -1204,17 +1648,19 @@ def main():
     parser = argparse.ArgumentParser(description="Plain-English terminal assistant for Fedora.")
     parser.add_argument("request", nargs="*", help="ask once and exit")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default {DEFAULT_MODEL})")
+    parser.add_argument("--think", choices=THINK_MODES, default=DEFAULT_THINK if DEFAULT_THINK in THINK_MODES
+                        else "auto", help="reason before answering: off, auto (default) or on")
     parser.add_argument("--no-banner", action="store_true", help="skip the welcome screen")
     args = parser.parse_args()
 
     if args.request:
         try:
-            handle(Session(args.model, keep_alive="2m"), " ".join(args.request))
+            handle(Session(args.model, keep_alive="2m", think=args.think), " ".join(args.request))
         except KeyboardInterrupt:
             print(paint("\n  Stopped.", DIM))
             sys.exit(130)
     else:
-        interactive(Session(args.model, keep_alive="10m"), not args.no_banner)
+        interactive(Session(args.model, keep_alive="10m", think=args.think), not args.no_banner)
 
 
 if __name__ == "__main__":

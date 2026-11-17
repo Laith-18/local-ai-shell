@@ -32,10 +32,18 @@ ai› how much storage do i have
 - **Follow-up questions** ("now sort that by size") via short conversation memory.
 - **Distro-aware.** The system prompt teaches it Fedora's conventions: `dnf` for packages (with read-only `dnf`/`rpm` queries allowlisted), Flathub for GUI apps, `systemctl --user` for Sunshine, and never touching the NVIDIA akmod. It started life on Bazzite (immutable Fedora Atomic) and was ported to regular Fedora by rewriting the prompts and safety rules; the original Bazzite rules are in the git history.
 - **VRAM dynamic.** The model only sits in VRAM while you're using it and is unloaded on exit
+- **Knows the machine it's on.** At startup it checks the OS, CPU, RAM, GPU and driver, motherboard, whether the internet is reachable, and which tools are installed, and puts those verified facts into every prompt. Static questions ("what motherboard do i have") are answered straight from them, and the model can't talk itself into "your NVIDIA driver isn't installed". See them with `/facts`.
+- **Checks commands before and after running them.**
+  - A program that isn't installed (or doesn't exist, like the `bless -t ~/Pictures` it once suggested) isn't run; it says so instead.
+  - A usage error (a wrong option or field name) triggers **one automatic retry**: the model gets the error plus the program's real `--help` text (for `nvidia-smi --query-gpu`, the actual list of valid field names) and writes a corrected command, which goes through the same safety checks.
+  - If a `| head -1` the model added left only column headings, it re-reads the full output rather than concluding there's no data.
+- **Known-good commands** for common questions (GPU stats, motherboard, BIOS, IP, updates, failed services, boot errors) are in the prompt, so it copies correct commands instead of recalling flags from memory.
+- **Thinks when it's worth it.** `/think auto` (the default) lets the model reason before answering "why…", troubleshooting and comparison questions, and when fixing a failed command; simple requests stay fast. `/think on` and `/think off` force it either way.
+- **Multi-line paste.** Paste an `nvidia-smi` table straight in and it arrives as one question, with or without bracketed paste in your terminal. You can also wrap text in `"""`.
 - **Guards against small-model failure modes:** token cap and runaway detection, no keyboard input for auto-run commands, and a rule against guessing facts about the machine.
 - Streaming replies, a welcome screen with live system stats, and speed and load time shown under every answer.
 - Single Python file, standard library only.
-- **Tested and evaluated.** ~280 pytest cases (safety classifier, parsing, Ctrl+C handling, eval harness) run in CI on Python 3.11–3.14, plus an automated eval harness for comparing models and prompts on 78 tasks. See [Testing & evaluation](#testing--evaluation).
+- **Tested and evaluated.** ~370 pytest cases (safety classifier, parsing, Ctrl+C handling, the checks around the model, eval harness) run in CI on Python 3.11–3.14, plus an automated eval harness for comparing models and prompts on 87 tasks. See [Testing & evaluation](#testing--evaluation).
 
 ## Hardware & stack
 
@@ -53,15 +61,20 @@ ai› how much storage do i have
 ```
 ai › "is sunshine running"
         │
-        ├─▶ system prompt (Fedora rules + things you've taught it) + recent conversation
+        ├─▶ system prompt (verified machine facts + Fedora rules + known-good commands
+        │   + things you've taught it) + recent conversation
         ▼
-  Ollama (localhost:11434) ──▶ qwen3.5:4b on the RTX 2060
+  Ollama (localhost:11434) ──▶ qwen3.5:4b on the RTX 2060 (reasons first for "why" questions)
         │  "$ systemctl --user status sunshine"
         ▼
   safety check ── blocked ──▶ refuse
         │
+  installed? ── no ──▶ say so, don't run it
+        │
         ├── read-only ──▶ run immediately, capture output
         └── changes something ──▶ explain + ask ──▶ run in a real terminal (script(1))
+        │
+  usage error? ── yes ──▶ model + real --help text ──▶ corrected command ──▶ back to the safety check (once)
         │
         ▼
   output ──▶ model ──▶ "Yes, Sunshine is running and has been up for 2 hours."
@@ -118,6 +131,13 @@ Nine command-generation tasks, graded by hand (full answers in `summary.md`):
 | A `$(cat)` command hung forever | `cat` waiting on keyboard input | Auto-run commands get no stdin; prompt rule against interactive commands |
 | Over-explained `echo hello` | Every result was summarised | Trivial or empty output is shown directly ("✓ Done.") |
 | Ctrl+C during a command crashed the whole session with a traceback | `KeyboardInterrupt` landed inside `proc.wait()` | Like a real shell, ai-shell ignores SIGINT while a command runs and lets the command handle it; regression test sends SIGINT to the process group |
+| Asked about the RTX 2060's VRAM, ran `nvidia-smi --query-gpu=... \| head -1`, saw only the CSV header, and told me my NVIDIA driver wasn't installed | `head -1` kept the header row; the model had no way to know the driver was fine | Header-only output is re-read without the `head`; verified machine facts (driver version included) go into every prompt, the summary step too |
+| Invented `nvidia-smi` fields (`compute.capability`, `architecture`) and an `-a` flag, then a fix tool that doesn't exist (`nvidia-configurator`) | Recalling flags from memory | Usage errors get one retry with the real help text (for `--query-gpu`, the actual field list); programs that aren't installed are never run |
+| Said "we're offline here" and that cloud AIs run at 20–40 tok/s | The prompt said it "needs no internet", which it read as "the machine is offline"; nothing stopped it inventing speed comparisons | The facts say whether the machine is online; the prompt explains its speed is normal for its size and rules out claims about other services |
+| Said `dnf upgrade --refresh` "isn't quite right" for Fedora | Small-model confusion, even though the prompt used that exact command | Shared Fedora facts in every prompt state that `update` is just another name for `upgrade` |
+| Asked "what motherboard do i have", ran `lspci \| grep VGA` and described the GPU | No known-good way to read the board | The board is in the facts; `/sys/class/dmi/id/board_*` is a known-good command |
+| Pasting an `nvidia-smi` table sent every line as a separate question | Each pasted newline acted as Enter | Bracketed paste re-enabled in readline, lines arriving within 50 ms are joined, and `"""` blocks work |
+| Kept suggesting htop, fastfetch and tmux after I said I'd tried them | Only 3 exchanges of history, no rule against repeating | 5 exchanges of history and a prompt rule; it's an eval task now |
 | `env rm -rf ~/Documents` would have **run without asking** (plus ~15 similar cases) | The read-only allowlist trusted program names, but `env`, GNU `sed`, `uniq`, `rg`, `nvidia-smi` and others can write, delete or execute with the right arguments | Per-program argument checks, found by writing a table-driven test suite (see below) |
 
 ## Testing & evaluation
@@ -154,9 +174,14 @@ python3 eval/run_eval.py --models qwen3.5:4b lfm2.5       # compare models
 python3 eval/run_eval.py --prompt minimal                 # ablation: without ai-shell's rules
 python3 eval/run_eval.py --temperature 0.7 --repeats 5    # how stable is it?
 python3 eval/run_eval.py --regrade eval/results/<run>      # re-score a saved run after grader/safety changes, no GPU
+python3 eval/run_eval.py --models qwen3.5:4b qwen3.5:9b --think   # a bigger model, with reasoning on
+python3 eval/from_history.py -o eval/drafts.toml          # draft new tasks from questions that went wrong
 ```
 
-- **78 tasks in `eval/tasks.toml`** across 13 categories: disk, processes, logs, services, packages, files, network, hardware, facts it must not guess (time, hostname), writing files, follow-up questions, general questions it should *answer* rather than run, and dangerous requests.
+`eval/from_history.py` reads ai-shell's own log and drafts tasks from the requests that went wrong: failed commands, usage errors that needed a retry, commands I corrected with `e` (the corrected command becomes the reference answer), cancellations, runaways and programs that weren't installed. I finish the regexes by hand and paste the good ones into `tasks.toml`.
+
+- **87 tasks in `eval/tasks.toml`** across 14 categories: disk, processes, logs, services, packages, files, network, hardware, facts it must not guess (time, hostname), writing files, follow-up questions, pasted output, general questions it should *answer* rather than run, and dangerous requests. Nine of them are real failures from my own sessions (see the failure table above).
+- The eval uses **fixed machine facts** for fedora-box, so scores don't depend on where it runs. For questions the facts already answer (CPU, kernel, driver version), a correct plain-English answer passes as well as the command.
 - **Graded by regex** (accepted and rejected forms, e.g. `apt` is wrong on Fedora). Each task also states the **expected safety tier**, so the report flags correct commands that would auto-run when they shouldn't, or prompt when they needn't.
 - **Dangerous requests pass** only if the model refuses, or the command is blocked or needs `yes` typed in full. The run fails if any would have auto-run.
 - **Metrics per model**: accuracy (mean ± SD across repeats), routing accuracy, consistency across repeats, p50/p95 latency, time to first token, generation tok/s, load time, VRAM, and per-category accuracy, with a table of every failure.
@@ -165,7 +190,8 @@ python3 eval/run_eval.py --regrade eval/results/<run>      # re-score a saved ru
 
 ## Limitations
 
-- **It's a 4B model.** It's good at single commands and short explanations, and unreliable at multi-step reasoning, obscure facts and anything agentic. It sits well below frontier cloud models.
+- **It's a 4B model.** It's good at single commands and short explanations, and unreliable at multi-step reasoning, obscure facts and anything agentic. It sits well below frontier cloud models. The checks around it catch the commonest mistakes, but they can't make it reason better. `qwen3.5:9b` is the obvious upgrade to try (`ai --model qwen3.5:9b`), but at Q4 it needs about 6.6 GB, so on a 6 GB card part of it spills into system RAM and it runs slower.
+- **Usage-error retries happen once**, and only for errors that look like a wrong option or field. Other failures (permission denied, a missing unit) are explained, not retried.
 - **The safety checks are a heuristic, not a sandbox.** The allowlist and patterns catch the common cases, but a determined or confused model could produce something they don't anticipate. Commands run as your user, which is why anything outside the read-only list needs your confirmation.
 - **Learned rules go into the prompt**, so a long list eats into the 4K context window. It's capped at 40.
 - **Fedora-specific.** The system prompt assumes Fedora with RPM Fusion. Other distros would need the prompts and package rules rewritten. The benchmark in `bench/` was run on the earlier Bazzite setup and still uses that prompt.
@@ -187,7 +213,12 @@ ln -sf ~/projects/local-ai-shell/ai-shell.py ~/.local/bin/ai
 ai
 ```
 
-Inside `ai`: `/help`, `/learned`, `/unlearn <n>`, `/forget`, `/raw`, `/stats`, `clear`, `exit`.
-Use a different model with `ai --model <name>` or `AI_SHELL_MODEL`.
+Inside `ai`: `/help`, `/learned`, `/unlearn <n>`, `/forget`, `/raw`, `/think off|auto|on`, `/facts`, `/stats`, `clear`, `exit`.
+
+| Setting | Flag | Environment variable | Default |
+|---|---|---|---|
+| Model | `--model` | `AI_SHELL_MODEL` | `qwen3.5:4b` |
+| Thinking | `--think off\|auto\|on` | `AI_SHELL_THINK` | `auto` |
+| Context window | | `AI_SHELL_NUM_CTX` | `8192` |
 
 To run the original speed benchmark: `bash bench/ai-bench.sh`. For accuracy, use the [eval harness](#eval-harness).
