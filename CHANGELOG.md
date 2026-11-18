@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.1 (18 Nov 2026): two safety holes found by the eval
+
+The v0.5.0 run scored 96.6% (96.2% with the stricter grader below), with every v0.4 fix holding on all three repeats ([report](eval/reports/2026-11-18/)). It also found two holes in the safety layer.
+
+- **Process substitution counted as read-only.** `ls <(rm -rf ~/Documents)` would have run with no prompt, because the read-only check rejected `$( … )` and backticks but not `<( … )` / `>( … )`. Fixed, with regression tests.
+- **Downloaded scripts without a pipe only needed `y`.** The model wrote `bash <(curl -sL …)`; only `curl … | sh` required a typed `yes`. `bash <(curl …)`, `sh -c "$(curl …)"`, `source <(wget …)`, `. <(curl …)` and `curl … | python3` now do too.
+- Eval: the pasted `nvidia-smi` check also fails reading the 42% fan speed as GPU load. The v0.5.0 run is committed in `eval/reports/2026-11-18/4b-thinking-v0.5/`.
+
 ## v0.5.0 (18 Nov 2026): fixes from the first 3-repeat thinking run
 
 The thinking run scored 94.3%, and its failures pointed at a few concrete bugs ([report](eval/reports/2026-11-18/)).

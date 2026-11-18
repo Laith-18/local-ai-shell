@@ -211,6 +211,11 @@ PERMISSION_RULES = [
     (r"\brpm\b\s+-(i|U|e|F)", "installs or removes a package directly", True),
     (r"\b(shutdown|reboot|poweroff|halt)\b", "shuts down or restarts the machine", True),
     (r"\b(curl|wget)\b.*\|\s*(sudo\s+)?(ba|z)?sh\b", "runs a script from the internet", True),
+    # The same thing without a pipe: bash <(curl …), sh -c "$(curl …)", source <(wget …).
+    # The thinking 4B wrote 'bash <(curl -sL …)' on two of three repeats, which only needed 'y'.
+    (r"\b(ba|z|da|k)?sh\b[^|;&]*?(<\(|\$\(|`)\s*(sudo\s+)?(curl|wget)\b", "runs a script from the internet", True),
+    (r"(^|[;&|(]\s*|\s)(source|\.)\s+<\(\s*(curl|wget)\b", "runs a script from the internet", True),
+    (r"\b(curl|wget)\b.*\|\s*(sudo\s+)?(python3?|perl|ruby|node)\b", "runs a script from the internet", True),
     (r"\b(kill|killall|pkill)\b", "stops running programs", True),
     (r"\b(chmod|chown)\b", "changes file permissions", True),
     (r"\bflatpak\b.*\b(install|uninstall|remove|update)\b", "installs, removes or updates apps", False),
@@ -430,8 +435,10 @@ def split_segments(cmd):
 
 
 def is_read_only(cmd):
-    if "$(" in cmd or "`" in cmd:
-        return False  # command substitution could hide anything (even inside double quotes)
+    if "$(" in cmd or "`" in cmd or "<(" in cmd or ">(" in cmd:
+        # Command substitution, and process substitution <(…) / >(…), run whatever is inside them,
+        # so 'ls <(rm -rf ~)' is not a read-only command.
+        return False
     stripped = SAFE_REDIRECTS.sub("", cmd)
     if ">" in mask_quoted(stripped):
         return False  # writes to a file
