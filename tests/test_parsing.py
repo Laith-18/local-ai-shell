@@ -69,3 +69,11 @@ def test_first_program_skips_env_vars_and_sudo(ai):
 
 def test_strip_ansi(ai):
     assert ai.strip_ansi("\x1b[1;32mok\x1b[0m") == "ok"
+
+
+def test_version_matches_pyproject(ai):
+    import tomllib
+
+    from conftest import ROOT
+    with open(ROOT / "pyproject.toml", "rb") as f:
+        assert tomllib.load(f)["project"]["version"] == ai.VERSION

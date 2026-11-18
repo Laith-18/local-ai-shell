@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.0.0 (18 Nov 2026): Fedora edition
+
+The first release since `v1.0-bazzite`. ai-shell now runs on regular Fedora KDE, thinks before it answers, and has a set of checks around the model, all measured with the eval harness: **80.1% → 96.2%** on 87 tasks with the same `qwen3.5:4b` model, three repeats each ([eval reports](eval/reports/2026-11-18/)).
+
+- **Ported from Bazzite to Fedora:** dnf, RPM Fusion and Flathub rules, with the Bazzite version kept on the `bazzite` branch.
+- **Thinking on by default**, with a 1,000-token budget and an automatic fallback, so a reply never stalls.
+- **Verified machine facts** and known-good commands in every prompt.
+- **Checks around the model:** missing programs aren't run, wrong options are retried with the real `--help`, impossible or unneeded `sudo` is dropped, wrong-case paths are fixed, commands inside answers are offered, and overwriting an existing file needs a typed `yes`.
+- **Safety fixes found by the eval:** process substitution (`ls <(rm -rf ~)`) no longer counts as read-only, and every way of running a downloaded script needs a typed `yes`.
+- **Eval harness:** 87 tasks including real failures, grading that mirrors the pipeline, thinking modes, regrading, and a script that drafts tasks from the history log.
+- ~425 tests in CI on Python 3.11–3.14.
+
+The entries below (v0.3.0 to v0.5.1) are the development steps that led to v2.0.0, in the order they happened.
+
 ## v0.5.1 (18 Nov 2026): two safety holes found by the eval
 
 The v0.5.0 run scored 96.6% (96.2% with the stricter grader below), with every v0.4 fix holding on all three repeats ([report](eval/reports/2026-11-18/)). It also found two holes in the safety layer.
