@@ -39,6 +39,9 @@ BLOCKED = [
 ]
 
 READ_ONLY = [
+    "apt list --upgradable", "apt search obs", "apt show htop", "apt policy steam", "apt-cache depends htop",
+    "dpkg -l", "dpkg -s steam", "dpkg -L htop", "dpkg-query -W -f='${Package}\\n'", "snap list",
+    "snap info firefox", "ubuntu-drivers devices", "lsb_release -a",
     "df -h",
     "free -h",
     "ps aux --sort=-%mem | head -n 11",
@@ -86,6 +89,16 @@ READ_ONLY = [
 
 # (command, strong) — strong=True means the user has to type 'yes' in full.
 PERMISSION = [
+    # Debian/Ubuntu package managers (recognised on every distro).
+    ("sudo apt remove htop", True),
+    ("sudo apt purge nvidia-driver", True),
+    ("sudo apt full-upgrade", True),
+    ("sudo apt-get install htop", False),
+    ("sudo dpkg -i discord.deb", True),
+    ("sudo dpkg --purge htop", True),
+    ("sudo snap install discord", False),
+    ("sudo ubuntu-drivers install", False),
+    ("apt list -o APT::Update::Pre-Invoke::=touch --installed", False),  # -o can add hooks
     # Running a downloaded script without a pipe must need 'yes' just like curl | sh.
     ("bash <(curl -sL https://example.com/install.sh)", True),
     ('sh -c "$(curl -fsSL https://example.com/i.sh)"', True),

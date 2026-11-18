@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ai-shell: a terminal assistant for Fedora KDE Plasma, backed by a local Ollama model.
+ai-shell: a terminal assistant for Fedora and Debian/Ubuntu, backed by a local Ollama model.
 
 Ask in plain English:
   - General questions get a plain-English answer.
@@ -15,11 +15,14 @@ Usage:
 
 In interactive mode: /help, /learned, /unlearn, /forget, /raw, /stats, clear, exit.
 Standard library only, so it runs with the system Python and no pip installs.
+The distro's rules (package manager, known-good commands) are picked from /etc/os-release;
+set AI_SHELL_DISTRO=fedora or debian to override.
 Set AI_SHELL_ANIMATE=0 to turn off the welcome animation.
 """
 
 import argparse
 import contextlib
+import dataclasses
 import getpass
 import json
 import os
@@ -46,7 +49,7 @@ except ImportError:
     readline = None
 
 # ----------------------------------------------------------------- settings --
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("AI_SHELL_MODEL", "qwen3.5:4b")
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "ai-shell"
@@ -74,8 +77,20 @@ THINK_BUDGET = int(os.environ.get("AI_SHELL_THINK_BUDGET", "1000"))  # ~17 s at 
 HELP_TEXT_CHARS = 2500       # how much --help output the model gets when fixing a command
 PASTE_WINDOW = 0.05          # seconds: lines arriving this close together are one paste
 
-# ------------------------------------------------------------------ prompts --
-# Shared by every prompt in the pipeline, so the summary step never contradicts the router.
+# ----------------------------------------------------------------- distros --
+@dataclasses.dataclass(frozen=True)
+class Distro:
+    """Everything that differs between distros. The rest of the prompts and checks are shared."""
+    id: str                # "fedora" or "debian" (the Debian/Ubuntu family)
+    name: str              # what the model is told it's running on, e.g. "Ubuntu"
+    rules: str             # facts shared by every prompt, so the summary never contradicts the router
+    packages: str          # how to install and remove software
+    commands: str          # extra known-good commands
+    wrong_pm: str          # regex for another distro's package manager
+    install_hint: str      # shown when a program isn't installed
+    desktop: str = ""      # named in the prompt if known (the Fedora prompt has always said KDE Plasma)
+
+
 FEDORA_RULES = """Fedora facts:
 - Software is installed with dnf (never yum, apt or rpm-ostree). RPM Fusion is enabled.
 - In dnf, "update" is just another name for "upgrade". --refresh makes dnf re-download the package lists first. Update everything with: sudo dnf upgrade --refresh
@@ -83,7 +98,90 @@ FEDORA_RULES = """Fedora facts:
 - Logs come from journalctl; there is no /var/log/syslog.
 - / and /home are btrfs subvolumes on the same partition, so count that space once. Ignore tmpfs, efivarfs and zram entries."""
 
-ROUTER_PROMPT = """You are ai-shell, a friendly assistant living in a terminal on Fedora Linux with the KDE Plasma desktop.
+FEDORA = Distro(
+    id="fedora", name="Fedora Linux", rules=FEDORA_RULES,
+    packages="""- Install software with dnf, e.g. $ sudo dnf install htop
+- GUI apps can also come from Flathub, e.g. $ flatpak install flathub discord
+- Never remove the NVIDIA driver (akmod-nvidia) or kernel packages unless the user asks for exactly that.
+- Containers use podman, not docker.""",
+    commands="- Are updates available: $ dnf check-upgrade",
+    wrong_pm=r"\b(yum|apt|apt-get|aptitude|rpm-ostree|zypper|pacman)\b",
+    install_hint="sudo dnf install {}",
+    desktop="KDE Plasma",
+)
+
+
+def debian_family(name, ubuntu):
+    """Debian, Ubuntu and their derivatives (Mint, Pop!_OS, ...): apt, with snap on Ubuntu."""
+    snap = ubuntu
+    rules = f"""{name} facts (Debian family):
+- Software is installed with apt (never dnf, yum or rpm-ostree). Use apt in commands, not apt-get.
+- In apt, "update" and "upgrade" are different: sudo apt update only refreshes the package lists, and sudo apt upgrade installs the updates. Update everything with: sudo apt update && sudo apt upgrade
+- apt list --upgradable shows the updates found by the last apt update.
+- Logs come from journalctl.
+- Ignore tmpfs, efivarfs{', squashfs (snap)' if snap else ''} and zram entries when counting disk space."""
+    if snap:
+        rules += "\n- Some apps (often Firefox) are snaps: list them with snap list; they aren't in dpkg or apt."
+    else:
+        rules += "\n- Proprietary drivers and firmware come from the non-free and non-free-firmware components."
+    packages = "- Install software with apt, e.g. $ sudo apt install htop"
+    packages += "\n- GUI apps can also come from Flathub if flatpak is installed, e.g. $ flatpak install flathub discord"
+    if snap:
+        packages += "\n- Or from the Snap Store, e.g. $ sudo snap install discord"
+    packages += ("\n- Never remove the NVIDIA driver (the nvidia-driver package) or linux-image packages unless the user "
+                 "asks for exactly that.\n- Containers: use podman or docker, whichever is installed.")
+    commands = """- Are updates available: $ apt list --upgradable
+- Update everything: $ sudo apt update && sudo apt upgrade
+- Is a package installed: $ dpkg -s steam"""
+    if ubuntu:
+        commands += "\n- Which NVIDIA driver is recommended: $ ubuntu-drivers devices\n- Snap apps: $ snap list"
+    return Distro(id="debian", name=name, rules=rules, packages=packages, commands=commands,
+                  wrong_pm=r"\b(dnf|dnf5|yum|rpm-ostree|zypper|pacman)\b", install_hint="sudo apt install {}")
+
+
+def parse_os_release(text):
+    out = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
+
+
+def detect_distro(os_release_text, override=None):
+    """Pick the rules for this machine from /etc/os-release (ID and ID_LIKE).
+
+    Anything in the Fedora family (Fedora, Nobara, Bazzite, RHEL) gets the Fedora rules; Debian,
+    Ubuntu and their derivatives get the apt rules. Anything else falls back to Fedora's.
+    """
+    info = parse_os_release(os_release_text)
+    family = {info.get("ID", "").lower(), *info.get("ID_LIKE", "").lower().split()}
+    ubuntu = "ubuntu" in family
+    name = info.get("NAME") or ("Ubuntu" if ubuntu else "Debian")
+    if override == "fedora":
+        return FEDORA
+    if override == "debian" or family & {"debian", "ubuntu"}:
+        if override == "debian" and not family & {"debian", "ubuntu"}:
+            name = "Debian"
+        return debian_family(name, ubuntu)
+    return FEDORA
+
+
+def this_distro():
+    try:
+        text = Path("/etc/os-release").read_text(errors="replace")
+    except OSError:
+        text = ""
+    override = os.environ.get("AI_SHELL_DISTRO", "").lower() or None
+    return detect_distro(text, override)
+
+
+DISTRO = this_distro()
+
+
+# ------------------------------------------------------------------ prompts --
+
+ROUTER_PROMPT = """You are ai-shell, a friendly assistant living in a terminal on {distro_long}.
 
 Decide what the user needs:
 - If the verified facts below answer the question, answer from them directly in plain English.
@@ -108,17 +206,14 @@ Command rules:
 - To create a new file, use a heredoc: the first line is $ cat > /path/to/file << 'EOF' then the file's
   content on the following lines, then EOF alone on the last line (use cat >> to append several lines).
   This is the only time you may reply with more than one line.
-- Install software with dnf, e.g. $ sudo dnf install htop
-- GUI apps can also come from Flathub, e.g. $ flatpak install flathub discord
-- Never remove the NVIDIA driver (akmod-nvidia) or kernel packages unless the user asks for exactly that.
-- Containers use podman, not docker.
+{package_rules}
 - Sunshine runs as a systemd USER service named exactly "sunshine": always add --user (systemctl --user, journalctl --user) and never sudo.
 - Ollama runs as a SYSTEM service named "ollama": no --user; sudo only to change it (start, stop, restart).
 - Never combine sudo with --user: it targets root's services, not yours, and fails.
 - "it", "that" and "this" mean the one thing just discussed. Act on that one thing only.
 - Only use sudo when actually required.
 
-{fedora_rules}
+{distro_rules}
 
 Known-good commands. When one fits the request, use it exactly:
 - GPU load, VRAM, temperature, power: $ nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv
@@ -128,7 +223,7 @@ Known-good commands. When one fits the request, use it exactly:
 - CPU details: $ lscpu
 - RAM sticks, speed and slots: $ sudo dmidecode -t memory
 - IP addresses: $ ip -brief address
-- Are updates available: $ dnf check-upgrade
+{distro_commands}
 - Failed services: $ systemctl --failed
 - Errors since boot: $ journalctl -b -p err --no-pager
 - Temperatures: $ sensors
@@ -148,7 +243,7 @@ Things the user has taught you. Always follow these; they override everything ab
 
 Context: {context}"""
 
-SUMMARY_PROMPT = """You are ai-shell on Fedora Linux (KDE Plasma). You ran a command for the user; now explain the result.
+SUMMARY_PROMPT = """You are ai-shell on {distro_short}. You ran a command for the user; now explain the result.
 Answer their original question directly in plain English, in 1-3 short sentences, using specific numbers and names from the output. No markdown, and don't restate the command.
 If the output already answers the question, just say it naturally in one short sentence.
 If the command failed, say what went wrong and suggest a fix in one sentence. Only suggest programs and options you are sure exist.
@@ -157,14 +252,23 @@ If the output is only column headings with no values, say the command returned n
 
 {facts}
 
-{fedora_rules}"""
+{distro_rules}"""
 
-FIX_PROMPT = """You are ai-shell on Fedora Linux. A command you suggested failed with a usage error (a wrong option or field name).
+FIX_PROMPT = """You are ai-shell on {distro}. A command you suggested failed with a usage error (a wrong option or field name).
 Using the error and the help text, reply with ONE line: "$ " followed by a corrected command that answers the user's question. Nothing else.
 Use only options and field names that appear in the help text. Don't add head or tail.
 If this program can't do it, use a different installed program instead.
 
 {facts}"""
+
+def render(template, distro=None, **fields):
+    """Fill a prompt template with the distro's parts plus the given fields."""
+    d = distro or DISTRO
+    return template.format(distro=d.name, distro_rules=d.rules, package_rules=d.packages,
+                           distro_commands=d.commands,
+                           distro_long=f"{d.name} with the {d.desktop} desktop" if d.desktop else d.name,
+                           distro_short=f"{d.name} ({d.desktop})" if d.desktop else d.name, **fields)
+
 
 EXPLAIN_PROMPT = """In one short sentence for a non-expert, say what this Linux command will change on the computer. Start with a verb. No markdown."""
 
@@ -208,8 +312,14 @@ PERMISSION_RULES = [
     (r"\b(dnf|dnf5)\b.*\b(remove|erase|autoremove|swap|distro-sync|system-upgrade|downgrade)\b",
      "removes software or changes the whole system", True),
     (r"\b(dnf|dnf5)\b.*\b(install|reinstall|upgrade|update)\b", "installs or updates software", False),
-    (r"\b(yum|apt|apt-get|rpm-ostree)\b", "uses a tool that isn't Fedora's package manager", False),
+    (r"\b(apt|apt-get|aptitude)\b.*\b(remove|purge|autoremove|full-upgrade|dist-upgrade)\b",
+     "removes software or changes the whole system", True),
+    (r"\b(apt|apt-get|aptitude)\b.*\b(install|reinstall|upgrade|update)\b", "installs or updates software", False),
+    (DISTRO.wrong_pm, f"uses a tool that isn't {DISTRO.name}'s package manager", False),
     (r"\brpm\b\s+-(i|U|e|F)", "installs or removes a package directly", True),
+    (r"\bdpkg\b\s+(-\w*[irP]|--install|--remove|--purge|--unpack|--configure)", "installs or removes a package directly", True),
+    (r"\bsnap\b.*\b(install|remove|refresh|revert)\b", "installs, removes or updates apps", False),
+    (r"\bubuntu-drivers\b.*\b(install|autoinstall)\b", "installs drivers", False),
     (r"\b(shutdown|reboot|poweroff|halt)\b", "shuts down or restarts the machine", True),
     (r"\b(curl|wget)\b.*\|\s*(sudo\s+)?(ba|z)?sh\b", "runs a script from the internet", True),
     # The same thing without a pipe: bash <(curl …), sh -c "$(curl …)", source <(wget …).
@@ -237,7 +347,8 @@ READ_ONLY_COMMANDS = {
     "lsusb", "lsmod", "findmnt", "ss", "netstat", "ping", "nvidia-smi", "sensors", "journalctl",
     "find", "tree", "realpath", "basename", "dirname", "sha256sum", "md5sum", "jq", "nproc",
     "vmstat", "iostat", "lsof", "fastfetch", "neofetch", "dmesg", "last", "w", "who", "locale",
-    "getent", "fc-list", "vulkaninfo", "glxinfo", "inxi", "test", "true", "clear",
+    "getent", "fc-list", "vulkaninfo", "glxinfo", "inxi", "test", "true", "clear", "dpkg-query",
+    "lsb_release",
     "top", "htop", "btop", "nvtop", "less", "more", "man",
 }
 READ_ONLY_SUBCOMMANDS = {
@@ -250,6 +361,10 @@ READ_ONLY_SUBCOMMANDS = {
     "dnf5": {"list", "info", "search", "repolist", "repoquery", "provides", "check-update",
              "check-upgrade"},
     "git": {"status", "log", "diff", "show"},
+    "apt": {"list", "search", "show", "policy", "depends", "rdepends"},
+    "apt-cache": {"search", "show", "policy", "depends", "rdepends", "pkgnames", "madison", "showpkg", "stats"},
+    "snap": {"list", "info", "find", "version", "connections", "services"},
+    "ubuntu-drivers": {"devices", "list"},
     "loginctl": {None, "list-sessions", "list-users", "show-session", "show-user",
                  "session-status", "user-status"},
     "timedatectl": {None, "status", "show"},
@@ -265,6 +380,8 @@ FORBIDDEN_FLAGS = {
                    "--sync", "--relinquish-var", "--setup-keys", "--update-catalog"},
     "dmesg": {"-c", "-C", "-D", "-E", "--clear", "--read-clear"},
     "date": {"-s", "--set"},
+    "apt": {"-o", "--option", "-c", "--config-file"},        # config options can add hook commands
+    "apt-cache": {"-o", "--option", "-c", "--config-file"},
     "git": {"--output", "--ext-diff"},                 # writes a file / runs a diff program
     "rg": {"--pre"},                                 # runs a program on every file
     "tree": {"-o"},                                    # writes its output to a file
@@ -285,6 +402,8 @@ UNIQ_VALUE_FLAGS = {"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-
 AWK_SIDE_EFFECTS = re.compile(r"system\s*\(|getline|[|>]")
 SED_SUBST_RE = re.compile(r"""[sy]([^\\\n])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1([A-Za-z0-9]*)""")
 SED_ADDRESS_RE = re.compile(r"/(?:\\.|[^/\\])*/|\\(.)(?:\\.|(?!\1).)*\1")
+DPKG_QUERIES = {"-l", "-L", "-s", "-S", "-p", "-c", "--list", "--listfiles", "--status", "--search",
+                "--print-avail", "--contents", "--get-selections", "--print-architecture"}
 IP_WRITE_WORDS = {"set", "add", "del", "delete", "flush", "change", "replace", "append"}
 
 # Full-screen programs: run attached to the terminal, nothing to summarise.
@@ -352,6 +471,8 @@ def segment_is_read_only(segment):
 
     if name == "ip":
         return not any(a in IP_WRITE_WORDS for a in args)
+    if name == "dpkg":  # only queries (dpkg -l, -L, -s, -S ...) are read-only
+        return bool(args) and args[0] in DPKG_QUERIES
     if name == "command":  # 'command -v X' only looks X up; 'command X' would run X
         return len(args) >= 2 and args[0] in ("-v", "-V")
     if name == "rpm":  # only queries (rpm -qa, rpm -qf, rpm -qi ...) are read-only
@@ -669,7 +790,7 @@ def offline_message(err):
 # (it used to claim the NVIDIA driver was missing, or that the machine was offline).
 NOTABLE_TOOLS = ["htop", "btop", "nvtop", "fastfetch", "neofetch", "tmux", "screen", "fzf", "bat", "jq",
                  "ripgrep:rg", "podman", "flatpak", "sensors", "dmidecode", "nmcli", "lspci", "lsusb",
-                 "inxi", "curl", "wget", "git", "python3", "ollama", "sunshine"]
+                 "inxi", "curl", "wget", "git", "python3", "ollama", "sunshine", "snap", "docker"]
 DMI = Path("/sys/class/dmi/id")
 
 
@@ -981,6 +1102,7 @@ class Session:
         self.model = model
         self.keep_alive = keep_alive
         self.think = think if think in THINK_MODES else "auto"
+        self.distro = DISTRO
         self.history = []
         self.show_output = True
         self.used_model = False
@@ -1152,7 +1274,9 @@ SUDO_USER_RE = re.compile(r"(^|&&|\|\||;)(\s*)sudo\s+(?:-\S+\s+)*((?:systemctl|j
 SUDO_QUERY_RE = re.compile(
     r"(^|&&|\|\||;|\|)(\s*)sudo\s+(?:-\S+\s+)*("
     r"(?:dnf5?)\s+(?:-\S+\s+)*(?:list|info|search|repolist|repoquery|provides|check-update|check-upgrade)\b"
-    r"|rpm\s+-q|flatpak\s+(?:list|info|search|remotes|remote-ls|history)\b)")
+    r"|rpm\s+-q|flatpak\s+(?:list|info|search|remotes|remote-ls|history)\b"
+    r"|apt\s+(?:list|search|show|policy|depends|rdepends)\b|apt-cache\s+\w|dpkg\s+-[lLsS]\b|dpkg-query\b"
+    r"|snap\s+(?:list|info|find)\b)")
 
 
 def normalise_command(cmd):
@@ -1350,7 +1474,7 @@ def help_text(cmd):
                 fields = re.findall(r'^"([\w.]+)"', run_quiet(["nvidia-smi", helper]), re.M)
                 if fields:
                     return f"Valid {query} fields: " + ", ".join(fields)
-    if prog in READ_ONLY_COMMANDS or prog in READ_ONLY_SUBCOMMANDS or prog in ("ip", "rpm"):
+    if prog in READ_ONLY_COMMANDS or prog in READ_ONLY_SUBCOMMANDS or prog in ("ip", "rpm", "dpkg"):
         try:
             done = subprocess.run([prog, "--help"], capture_output=True, text=True, timeout=3,
                                   stdin=subprocess.DEVNULL)
@@ -1495,7 +1619,7 @@ def summarise(session, request, cmd, code, output, note=""):
     if len(output) > SUMMARY_INPUT_CHARS:
         half = SUMMARY_INPUT_CHARS // 2
         output = output[:half] + "\n...[output trimmed]...\n" + output[-half:]
-    system = SUMMARY_PROMPT.format(facts=session.facts, fedora_rules=FEDORA_RULES)
+    system = render(SUMMARY_PROMPT, session.distro, facts=session.facts)
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": f"Question: {request}\nCommand: {cmd}\nExit code: {code}\n"
@@ -1521,8 +1645,8 @@ def summarise(session, request, cmd, code, output, note=""):
 
 
 def router_messages(session, request):
-    system = ROUTER_PROMPT.format(context=context_line(), model=session.model, memories=memories_for_prompt(),
-                                  facts=session.facts, fedora_rules=FEDORA_RULES)
+    system = render(ROUTER_PROMPT, session.distro, context=context_line(), model=session.model,
+                    memories=memories_for_prompt(), facts=session.facts)
     return [{"role": "system", "content": system}, *session.history, {"role": "user", "content": request}]
 
 
@@ -1534,7 +1658,7 @@ def fix_command(session, request, cmd, output):
     helptext = help_text(cmd)
     error = output.strip()[-1500:] or "(no output)"
     messages = [
-        {"role": "system", "content": FIX_PROMPT.format(facts=session.facts)},
+        {"role": "system", "content": render(FIX_PROMPT, session.distro, facts=session.facts)},
         {"role": "user", "content": f"Question: {request}\nFailed command: {cmd}\nError:\n{error}\n\n"
                                     f"Help text:\n{helptext or '(no help text available)'}"},
     ]
@@ -1664,7 +1788,7 @@ def approve(session, request, cmd, entry):
             names = ", ".join(missing)
             print(f"\n  {paint('Not run:', YELLOW, BOLD)} {names} {'is' if len(missing) == 1 else 'are'} "
                   f"not installed on this machine.")
-            print(paint(f"  If it's a real package, try: sudo dnf install {missing[0]}  "
+            print(paint(f"  If it's a real package, try: {DISTRO.install_hint.format(missing[0])}  "
                         f"(or ask me for another way)", DIM))
             session.remember(request, f"$ {cmd}\n(not run: {names} not installed)")
             log({**entry, "command": cmd, "decision": "missing", "missing": missing})
@@ -1892,7 +2016,7 @@ def interactive(session, show_banner):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plain-English terminal assistant for Fedora.")
+    parser = argparse.ArgumentParser(description="Plain-English terminal assistant for Fedora and Debian/Ubuntu.")
     parser.add_argument("request", nargs="*", help="ask once and exit")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default {DEFAULT_MODEL})")
     parser.add_argument("--think", choices=THINK_MODES, default=DEFAULT_THINK if DEFAULT_THINK in THINK_MODES

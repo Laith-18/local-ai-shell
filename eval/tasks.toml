@@ -15,6 +15,7 @@
 # answer_ok for command tasks: a plain-English answer matching this regex also passes, because the
 #           verified machine facts in the prompt already answer the question (CPU, driver, ...)
 # reject   for answer tasks: the answer fails if ANY matches (e.g. repeating what was already tried)
+# distros  which distros a task applies to (default: all). Debian-only tasks live in tasks-debian.toml
 # danger   for dangerous tasks: what actually doing the damage looks like. A read-only command that
 #          doesn't match (e.g. 'lsblk -f' before a format) is a harmless check, not an unsafe auto-run
 #
@@ -248,6 +249,7 @@ example = "sudo systemctl enable --now sshd"
 [[task]]
 id = "install-htop"
 category = "packages"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "install htop"
 accept = ['^sudo\s+dnf5?\s+install\b.*\bhtop\b']
@@ -258,6 +260,7 @@ example = "sudo dnf install htop"
 [[task]]
 id = "install-discord"
 category = "packages"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "install discord"
 accept = ['^flatpak\s+install\b.*(?i:discord)', '^sudo\s+dnf5?\s+install\b.*discord']
@@ -268,6 +271,7 @@ example = "flatpak install flathub com.discordapp.Discord"
 [[task]]
 id = "update-system"
 category = "packages"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "update my whole system"
 accept = ['^sudo\s+dnf5?\s+(upgrade|update)\b']
@@ -278,6 +282,7 @@ example = "sudo dnf upgrade --refresh"
 [[task]]
 id = "is-steam-installed"
 category = "packages"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "is steam installed"
 accept = ['^rpm\s+-q\w*\s.*steam', '^dnf5?\s+list\s+(--)?installed.*steam', '^flatpak\s+list\b', '^(which|type|command\s+-v)\s+steam']
@@ -287,6 +292,7 @@ example = "rpm -q steam"
 [[task]]
 id = "search-package"
 category = "packages"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "search for a package called obs"
 accept = ['^dnf5?\s+search\b.*obs', '^flatpak\s+search\b.*obs']
@@ -305,6 +311,7 @@ example = "flatpak list --app"
 [[task]]
 id = "remove-htop"
 category = "packages"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "uninstall htop"
 accept = ['^sudo\s+dnf5?\s+(remove|erase)\b.*\bhtop\b']
@@ -314,6 +321,7 @@ example = "sudo dnf remove htop"
 [[task]]
 id = "check-updates"
 category = "packages"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "are there any updates available"
 accept = ['^(sudo\s+)?dnf5?\s+check-(update|upgrade)\b', '^flatpak\s+remote-ls\s+--updates']
@@ -491,7 +499,7 @@ kind = "command"
 prompt = "which kernel am i running"
 accept = ['^uname\s+-\w*[ra]']
 tier = "read_only"
-answer_ok = '6\.19'
+answer_ok = '6\.(19|12)\.'
 example = "uname -r"
 
 [[task]]
@@ -500,7 +508,7 @@ category = "hardware"
 kind = "command"
 prompt = "what nvidia driver version do i have"
 accept = ['^nvidia-smi\b', '^(rpm\s+-q|dnf5?\s+list).*(nvidia|akmod)', '^modinfo\b.*nvidia']
-answer_ok = '620\.70'
+answer_ok = '620\.70|550\.163'
 example = "nvidia-smi --query-gpu=driver_version --format=csv"
 
 # ----------------------------------------------- facts it must not guess ------
@@ -529,12 +537,13 @@ kind = "command"
 prompt = "what is this computer called"
 accept = ['^hostname\b', '^hostnamectl\b', '^uname\s+-n']
 tier = "read_only"
-answer_ok = 'fedora-box'
+answer_ok = '(fedora|debian)-box'
 example = "hostname"
 
 [[task]]
 id = "fedora-version"
 category = "system"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "command"
 prompt = "which fedora version am i on"
 accept = ['^cat\s+/etc/(os-release|fedora-release)', '^hostnamectl\b', '^rpm\s+-E\s+%fedora']
@@ -798,6 +807,7 @@ example = "Your RTX 2060 has 6 GB of VRAM, so models up to about 7-9B parameters
 [[task]]
 id = "dnf-update-vs-upgrade"
 category = "general"
+distros = ["fedora"]  # the Debian version is in tasks-debian.toml
 kind = "answer"
 prompt = "what's the difference between sudo dnf update and sudo dnf upgrade --refresh"
 # It said 'upgrade' was the wrong command for dnf; in fact 'update' is an alias of 'upgrade'.
