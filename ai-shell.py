@@ -46,6 +46,7 @@ except ImportError:
     readline = None
 
 # ----------------------------------------------------------------- settings --
+VERSION = "2.0.0"
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("AI_SHELL_MODEL", "qwen3.5:4b")
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "ai-shell"
@@ -1897,6 +1898,7 @@ def main():
     parser.add_argument("--think", choices=THINK_MODES, default=DEFAULT_THINK if DEFAULT_THINK in THINK_MODES
                         else "auto", help="reason before answering: off, auto (default) or on")
     parser.add_argument("--no-banner", action="store_true", help="skip the welcome screen")
+    parser.add_argument("--version", action="version", version=f"ai-shell {VERSION}")
     args = parser.parse_args()
 
     if args.request:
