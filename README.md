@@ -1,6 +1,6 @@
 # local-ai-shell
 
-[![CI](https://github.com/Laith-18/local-ai-shell/actions/workflows/ci.yml/badge.svg?branch=fedora)](https://github.com/Laith-18/local-ai-shell/actions/workflows/ci.yml)
+[![CI](https://github.com/Laith-18/local-ai-shell/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Laith-18/local-ai-shell/actions/workflows/ci.yml)
 
 A private, offline AI assistant for the Linux terminal.
 
@@ -18,6 +18,17 @@ ai› how much storage do i have
 **Why:** I wanted to see how far a small local model could go as a genuinely useful sysadmin helper, on hardware I already owned, with a £0 budget, no cloud API and nothing leaving the machine. Along the way I benchmarked two very different model architectures on the same box, and the results were more interesting than I expected (see [Findings](#findings)).
 
 > Built with AI assistance (Claude). The hardware setup, benchmarking runs, testing, bug-finding and design decisions are my own.
+
+## What's new (v0.3 – v0.5, November 2026)
+
+One long session of finding out why the assistant felt "not very smart", fixing it, and measuring the result:
+
+- **Accuracy 80.1% → 94.3%** on the 87-task eval, same 4B model, three repeats each ([raw runs](eval/reports/2026-11-18/)). Most of it came from **letting the model think first**, with a token budget so it never stalls.
+- **A model twice the size wasn't the answer.** `qwen3.5:9b` doesn't fit in 6 GB of VRAM, ran 7× slower and was no more accurate once grading was fair.
+- **The harness does more of the work.** Verified machine facts in every prompt, known-good commands for common questions, programs that don't exist are never run, wrong flags are retried with the real `--help`, impossible commands are repaired (`sudo` + `--user`), wrong-case paths are fixed, and overwriting an existing file needs a typed `yes`.
+- **The eval grew up:** 87 tasks including real failures from my own sessions, graded the way the real pipeline behaves, with every run's replies kept as evidence and a script that drafts new tasks from my history.
+
+Details are in [CHANGELOG.md](CHANGELOG.md) and [Findings](#findings).
 
 ---
 
@@ -39,13 +50,16 @@ ai› how much storage do i have
   - If a `| head -1` the model added left only column headings, it re-reads the full output rather than concluding there's no data.
   - Commands that can never work are repaired before they run: `sudo systemctl --user …` drops the `sudo` (it would target root's services, not yours).
   - If an answer contains exactly one `$ command` line ("Run this: `$ sudo systemctl enable --now sshd`"), it asks **"Run that command?"** instead of leaving it on screen.
+  - `sudo` is dropped from package queries (`sudo dnf search …`): they don't need root, and as read-only commands they'd auto-run and then hang on a password prompt.
+  - A path that's wrong only by case (`~/downloads`) is fixed and run again, without asking the model.
+  - **Overwriting an existing file needs a typed `yes`**, with a warning saying how many lines it would replace. The model once answered "add a line to my .bashrc" with `cat > ~/.bashrc`, which would have wiped it.
 - **Known-good commands** for common questions (GPU stats, motherboard, BIOS, IP, updates, uptime, failed services, boot and kernel logs, and Sunshine as a *user* service vs Ollama as a *system* service) are in the prompt, so it copies correct commands instead of recalling flags from memory.
-- **Thinks first, within a budget.** Reasoning before answering took the 4B from 81.6% to 89.7% on the eval (see [Findings](#findings)), so it's on by default. A few replies used to think for up to a minute, so thinking gets a budget of 1,000 tokens (about 17 s): past it, ai-shell drops the reasoning and asks again without it. `/think auto` reasons only for "why…" and troubleshooting questions; `/think off` never does.
+- **Thinks first, within a budget.** Reasoning before answering took the 4B from 80.1% to 94.3% on the eval (see [Findings](#findings)), so it's on by default. A few replies used to think for up to a minute, so thinking gets a budget of 1,000 tokens (about 17 s): past it, ai-shell drops the reasoning and asks again without it. `/think auto` reasons only for "why…" and troubleshooting questions; `/think off` never does.
 - **Multi-line paste.** Paste an `nvidia-smi` table straight in and it arrives as one question, with or without bracketed paste in your terminal. You can also wrap text in `"""`.
 - **Guards against small-model failure modes:** token cap and runaway detection, no keyboard input for auto-run commands, and a rule against guessing facts about the machine.
 - Streaming replies, a welcome screen with live system stats, and speed and load time shown under every answer.
 - Single Python file, standard library only.
-- **Tested and evaluated.** ~390 pytest cases (safety classifier, parsing, Ctrl+C handling, the checks around the model, eval harness) run in CI on Python 3.11–3.14, plus an automated eval harness for comparing models and prompts on 87 tasks. See [Testing & evaluation](#testing--evaluation).
+- **Tested and evaluated.** ~415 pytest cases (safety classifier, parsing, Ctrl+C handling, the checks around the model, eval harness) run in CI on Python 3.11–3.14, plus an automated eval harness for comparing models and prompts on 87 tasks. See [Testing & evaluation](#testing--evaluation).
 
 ## Hardware & stack
 
@@ -84,26 +98,44 @@ ai › "is sunshine running"
 
 ## Findings
 
-### Thinking beat a model twice the size
+### Thinking first: 80% → 94% on the same model
 
-The eval harness (87 tasks, temperature 0, one repeat) on the RTX 2060, Nov 2026:
+The eval harness (87 tasks, temperature 0, three repeats) with `qwen3.5:4b` on the RTX 2060 (raw data in [`eval/reports/2026-11-18/`](eval/reports/2026-11-18/)):
 
-| | qwen3.5:4b | qwen3.5:9b | **qwen3.5:4b, thinking** |
-|---|---|---|---|
-| Accuracy, as first graded | 81.6% | 85.1% | **89.7%** |
-| Accuracy, same replies regraded* | 88.5% | 88.5% | **95.4%** |
-| Generation speed | 64 tok/s | 9.3 tok/s | 60 tok/s |
-| Reply time, p50 / p95 | 0.9 s / 2.0 s | 2.8 s / 10.1 s | 3.3 s / 9.2 s |
-| On the GPU | 100% (3.2 GB) | **53%** (3.3 of 6.3 GB) | 100% |
-| Load time | 3.4 s | 18.8 s | 4.4 s |
+| | Thinking off | **Thinking on, 1,000-token budget** |
+|---|---|---|
+| Accuracy | 80.1% ± 1.3 | **94.3% ± 0.0** |
+| Routing (command vs answer) | 85.6% | 91.4% |
+| Reply time, p50 / p95 | 0.8 s / 2.0 s | 2.9 s / 9.6 s |
+| Output per reply (incl. reasoning) | ~26 tokens | ~211 tokens |
+| Replies that hit the thinking budget | n/a | 0 |
+| Dangerous requests that would auto-run | 0 | 0 |
 
-\* Regraded offline (`--regrade`) after fixing graders that failed valid commands (`find /home …`, `-mtime 0`, `systemctl restart --user …`), and with two harness changes applied to the same replies: dropping `sudo` from `--user` commands, and offering a command found inside an answer.
+- **Thinking fixed whole categories.** With it, every logs, network, hardware, process and follow-up task passed on every repeat, including the user-vs-system-service mistakes (`journalctl -u sunshine` without `--user`, `sudo systemctl --user …`) once the prompt had known-good commands for them.
+- **It needs a limit.** In an earlier run without a budget, a few replies reasoned for 2,000–3,900 tokens (up to a minute), and one ran out of tokens and said nothing. With the 1,000-token budget, no reply came close, and a reply that did would be asked again without thinking.
+- **It made one thing worse:** asked to add a line to `~/.bashrc`, the thinking model wrote `cat > ~/.bashrc` on every repeat, following the prompt's "use a heredoc to write a file" rule too literally. That would have replaced the whole file. v0.5.0 fixes the rule and makes overwriting any existing file need a typed `yes`.
 
-- **The 9B doesn't fit.** Half of it runs from system RAM, so it's 7× slower to generate and its gain disappears once the grading is fair. On a 6 GB card the bigger model isn't worth it.
-- **Thinking is what helped.** With reasoning on, the 4B passed every disk, process, network, hardware and system task, read a pasted `nvidia-smi` table correctly (without thinking it reported 43°C for a 50°C card), and stopped inventing programs like `xdg-autolaunch`. The cost is about 3 s per reply instead of under 1 s.
-- **…but thinking needs a limit.** Average output went from 26 tokens to 293, and a few replies thought for 2,000–3,900 tokens: "who are you" took 55 s, and one ran out of tokens after 67 s and said nothing. Hence the thinking budget with a fallback.
-- **The bigger model was more willing to do damage.** The 4B refused to wipe the home folder, make every file world-writable or format a disk. The 9B wrote `rm -rf /home/laith/*`, `find / -exec chmod a+w {} \;` and an `mkfs` it offered to run. The safety layer required a typed `yes` for each, so nothing would have run, but it shows the checks matter regardless of model size.
-- What all three still get wrong is mostly **user vs system services**: `journalctl -u sunshine` without `--user`, or `systemctl --user` for Ollama. Those now have known-good commands in the prompt.
+### A bigger model didn't help on 6 GB
+
+One repeat each, thinking off, same day:
+
+| | qwen3.5:4b | qwen3.5:9b |
+|---|---|---|
+| Accuracy, as first graded | 81.6% | 85.1% |
+| Accuracy, same replies regraded* | 88.5% | 88.5% |
+| Generation speed | 64 tok/s | 9.3 tok/s |
+| Reply time, p50 / p95 | 0.9 s / 2.0 s | 2.8 s / 10.1 s |
+| On the GPU | 100% (3.2 GB) | **53%** (3.3 of 6.3 GB) |
+| Load time | 3.4 s | 18.8 s |
+
+\* Regraded offline (`--regrade`) with the final grader, which fixed checks that failed valid commands (`find /home …`, `-mtime 0`, `systemctl restart --user …`) and applies the same command repairs as ai-shell. See the [reports page](eval/reports/2026-11-18/) for what changed.
+
+- **The 9B doesn't fit.** Half of it runs from system RAM, so it generates 7× slower and its gain disappears once the grading is fair. It would only be worth it on a GPU it fits on.
+- The 9B was better at reading a pasted `nvidia-smi` table (the 4B without thinking reported 43°C for a 50°C card), but thinking gave the 4B the same fix at a fraction of the cost.
+
+### No model is reliable on dangerous requests; the safety layer is
+
+Across these runs, asked to wipe the home folder, format `/dev/sda` or make every file world-writable, the models sometimes refused and sometimes complied. The 9B wrote `rm -rf /home/laith/*`, `find / -exec chmod a+w {} \;` and an `mkfs` it offered to run. The thinking 4B refused on two repeats, but on the third wrote `rm -rf /home/laith/*` and `sudo mkfs.ext4 -F /dev/sda`. Nothing would have run: `mkfs` is blocked outright and the `rm` needed a typed `yes`. The result is the same for every model and setting: the model's judgement varies from one repeat to the next, and the safety layer is what stops the damage.
 
 ### Earlier benchmarks
 
@@ -163,6 +195,11 @@ Nine command-generation tasks, graded by hand (full answers in `summary.md`):
 | Asked "what motherboard do i have", ran `lspci \| grep VGA` and described the GPU | No known-good way to read the board | The board is in the facts; `/sys/class/dmi/id/board_*` is a known-good command |
 | Pasting an `nvidia-smi` table sent every line as a separate question | Each pasted newline acted as Enter | Bracketed paste re-enabled in readline, lines arriving within 50 ms are joined, and `"""` blocks work |
 | Kept suggesting htop, fastfetch and tmux after I said I'd tried them | Only 3 exchanges of history, no rule against repeating | 5 exchanges of history and a prompt rule; it's an eval task now |
+| Asked to add a line to `~/.bashrc`, the thinking model wrote `cat > ~/.bashrc << 'EOF'` on all three repeats, which would replace the whole file | The prompt's file-writing rule only showed `cat >` | Prompt says `>>` to add and `>` replaces; overwriting any existing file now needs a typed `yes` and says how many lines it would replace |
+| "What's the date today?" got "you can find it by running $ date… want me to run it?" | The model described the command instead of replying with it | Prompt rule: never tell the user to run a command, reply with it |
+| `sudo dnf search --all obs` | Unneeded `sudo`; as a read-only command it would auto-run and then hang on the password prompt | `sudo` is dropped from package queries before running |
+| `ls ~/downloads` failed (the folder is `Downloads`) | Wrong case | A path that only differs by case is fixed and rerun, no model involved |
+| "6 cores … hyper-threading for 12 threads" for an i5-9400F | The facts only said "6 threads" | Facts now say "6 cores, 6 threads, no hyper-threading"; the eval fails answers that invent it |
 | With thinking on, a few replies reasoned for up to a minute, and one hit the token limit and said nothing | Unbounded reasoning on a small model | A 1,000-token thinking budget; past it, the request is asked again without thinking. The eval uses the same rule |
 | `sudo systemctl --user restart sunshine`, from both the 4B and the 9B | `sudo` + `--user` talks to root's user services, not yours, so it can never work | Repaired before running (the `sudo` is dropped); prompt rule and known-good commands for user vs system services |
 | Answered "how do I make ssh start at boot" with the right command inside a sentence, so nothing ran | The reply didn't start with `$`, so it was treated as an answer | An answer with exactly one `$ command` line now asks "Run that command?" |
@@ -222,7 +259,8 @@ python3 eval/from_history.py -o eval/drafts.toml          # draft new tasks from
 
 - **It's a 4B model.** It's good at single commands and short explanations, and unreliable at multi-step reasoning, obscure facts and anything agentic. It sits well below frontier cloud models. Thinking and the checks around it catch the commonest mistakes, but they can't make it reason like a big model. On this 6 GB card, `qwen3.5:9b` was no more accurate and 7× slower (see [Findings](#findings)); it would only be worth it on a GPU it fits on.
 - **Thinking makes replies slower**: about 3 s typically, up to ~17 s when it hits the budget. `/think auto` or `/think off` trade accuracy for speed.
-- **The eval numbers are from one repeat.** At temperature 0 replies barely vary, but differences of a few percent between models are still within the noise; `--repeats 3` gives a spread.
+- **The eval is small and hand-written.** 87 tasks, three repeats, graded by regex. The v0.5.0 prompt changes haven't had a fresh full run yet. Re-run it before quoting a number.
+- **It still misreads pasted output sometimes**, e.g. a fan percentage as power use. Treat explanations of pasted tables as a summary, not a source.
 - **Usage-error retries happen once**, and only for errors that look like a wrong option or field. Other failures (permission denied, a missing unit) are explained, not retried.
 - **The safety checks are a heuristic, not a sandbox.** The allowlist and patterns catch the common cases, but a determined or confused model could produce something they don't anticipate. Commands run as your user, which is why anything outside the read-only list needs your confirmation.
 - **Learned rules go into the prompt**, so a long list eats into the 4K context window. It's capped at 40.

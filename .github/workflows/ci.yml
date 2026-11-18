@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, fedora]
+    branches: [main]
   pull_request:
 
 permissions:

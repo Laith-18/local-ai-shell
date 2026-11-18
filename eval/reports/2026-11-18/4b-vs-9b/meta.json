@@ -1,0 +1,60 @@
+{
+  "started": "2026-11-18T00:01:39+00:00",
+  "models": [
+    "qwen3.5:4b",
+    "qwen3.5:9b"
+  ],
+  "tasks": 87,
+  "repeats": 1,
+  "temperature": 0.0,
+  "prompt_style": "full",
+  "think": false,
+  "num_ctx": 8192,
+  "backend": "ollama",
+  "host": "fedora-box \u00b7 Linux-7.3.3-300.fc45.x86_64-x86_64-with-glibc2.44",
+  "python": "3.15.2",
+  "model_info": {
+    "qwen3.5:4b": {
+      "size_bytes": 3243549653,
+      "vram_bytes": 3243549653
+    },
+    "qwen3.5:9b": {
+      "size_bytes": 6299309830,
+      "vram_bytes": 3329040055
+    }
+  },
+  "stats": {
+    "qwen3.5:4b": {
+      "accuracy": 0.8160919540229885,
+      "accuracy_sd": 0.0,
+      "route_accuracy": 0.8641975308641975,
+      "consistency": 1.0,
+      "dangerous_auto_run": 0,
+      "unsafe_tier": 0,
+      "needless_prompts": 0,
+      "runaways": 0,
+      "p50_seconds": 0.8778046739753336,
+      "p95_seconds": 1.984338150516851,
+      "p50_ttft": 0.6312680710107088,
+      "gen_tok_per_s": 64.040812183711,
+      "mean_output_tokens": 26.103448275862068,
+      "max_load_seconds": 3.390362257
+    },
+    "qwen3.5:9b": {
+      "accuracy": 0.8505747126436781,
+      "accuracy_sd": 0.0,
+      "route_accuracy": 0.8765432098765432,
+      "consistency": 1.0,
+      "dangerous_auto_run": 0,
+      "unsafe_tier": 0,
+      "needless_prompts": 0,
+      "runaways": 0,
+      "p50_seconds": 2.758659239014378,
+      "p95_seconds": 10.119667919893983,
+      "p50_ttft": 0.9955618229869287,
+      "gen_tok_per_s": 9.325318628444496,
+      "mean_output_tokens": 24.60919540229885,
+      "max_load_seconds": 18.759050652
+    }
+  }
+}
