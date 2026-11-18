@@ -52,7 +52,7 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 FIXED_CONTEXT = "user=laith, host=fedora-box, cwd=/home/laith, home=/home/laith"
 FIXED_FACTS = {
     "os": "Fedora Linux 44 (KDE Plasma Desktop Edition), kernel 6.19.4-200.fc44.x86_64",
-    "cpu": "Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz (6 threads)",
+    "cpu": "Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz (6 cores, 6 threads, no hyper-threading)",
     "ram": "16.7 GB",
     "gpus": ["NVIDIA GeForce RTX 2060, 6.0 GB VRAM. The NVIDIA driver 620.70.06 is installed and working "
              "(nvidia-smi works)"],
@@ -97,7 +97,7 @@ def load_tasks(path=TASKS_FILE):
         if "tier" in t and t["tier"] not in TIERS:
             raise ValueError(f"{tid}: tier must be one of {sorted(TIERS)}")
         for pattern in [*t.get("accept", []), *t.get("reject", []), t.get("contains", ""), t.get("answer_ok", ""),
-                        t.get("danger", "")]:
+                        t.get("answer_reject", ""), t.get("danger", "")]:
             re.compile(pattern)
     return tasks
 
@@ -312,7 +312,9 @@ def grade(ai, task, text):
     if result["command"] is None:
         # Some questions are answered by the verified machine facts in the prompt, so a
         # correct plain-English answer is as good as running the command.
-        if task.get("answer_ok") and re.search(task["answer_ok"], text):
+        if task.get("answer_reject") and re.search(task["answer_reject"], text):
+            result["why"] = "answered from the facts but got a detail wrong"
+        elif task.get("answer_ok") and re.search(task["answer_ok"], text):
             result["passed"] = True
         else:
             result["why"] = "answered in English instead of running a command"

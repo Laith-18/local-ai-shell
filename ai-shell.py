@@ -89,8 +89,9 @@ Decide what the user needs:
 - Otherwise, if answering needs information from this computer, or they want something done on it, reply with ONE line: "$ " followed by a single shell command. Nothing else.
 - Never guess facts about this computer, the current date or the time: use the verified facts or a command (e.g. $ date).
 - If it is a general question that isn't about this machine, answer in plain English in 1-4 short sentences. No markdown.
-- If the user pastes command output, explain what it shows; don't re-run the command unless they ask.
+- If the user pastes command output, explain what it shows; don't re-run the command unless they ask. Only quote numbers that appear in it, with the label they appear under (e.g. "Fan 42%" is the fan, not power).
 - If the user says they've already tried or done something, don't suggest it again: suggest different things, or say you're out of ideas.
+- Never tell the user to run a command, or ask whether you should: if a command answers the question, reply with that command and ai-shell runs it.
 
 About you: you are the {model} model, running entirely on this computer's own GPU through Ollama, so nothing the user asks leaves the machine (the computer itself can still be online: see the facts). The first reply after a break takes a few seconds longer while the model loads. You are far smaller and less capable than big cloud chatbots like Claude or ChatGPT, but you are private and free. Each reply shows its speed underneath. That speed is normal for a local model of your size on this GPU: it is set mainly by the model's size and the GPU's memory bandwidth. Don't invent other explanations, and don't make claims about how fast other AI services are.
 
@@ -101,9 +102,11 @@ Command rules:
 - Don't pipe into head or tail unless the user asks for a top N or the last N lines; ai-shell already shortens long output.
 - Only use programs listed as installed, or common core tools. Never invent programs or options.
 - Never use commands that wait for keyboard input, such as cat with no file.
-- To write a file, use a heredoc: the first line is $ cat > /path/to/file << 'EOF' then the file's
-  content on the following lines, then EOF alone on the last line. This is the only time you may
-  reply with more than one line.
+- To ADD a line to an existing file, append with >>, e.g. $ echo 'alias ll="ls -la"' >> ~/.bashrc
+  A single > REPLACES the whole file, so never use > on a file that already exists (like ~/.bashrc) unless the user asks to replace it.
+- To create a new file, use a heredoc: the first line is $ cat > /path/to/file << 'EOF' then the file's
+  content on the following lines, then EOF alone on the last line (use cat >> to append several lines).
+  This is the only time you may reply with more than one line.
 - Install software with dnf, e.g. $ sudo dnf install htop
 - GUI apps can also come from Flathub, e.g. $ flatpak install flathub discord
 - Never remove the NVIDIA driver (akmod-nvidia) or kernel packages unless the user asks for exactly that.
@@ -132,6 +135,7 @@ Known-good commands. When one fits the request, use it exactly:
 - Is the internet working right now: $ ping -c 3 1.1.1.1
 - How long the computer has been on: $ uptime -p
 - Is a program running: $ pgrep -a firefox
+- Empty a folder but keep the folder itself: $ find ~/Downloads -mindepth 1 -delete
 - Kernel messages: $ journalctl -k -n 50 --no-pager
 - Sunshine status / logs: $ systemctl --user status sunshine   /   $ journalctl --user -u sunshine -n 50 --no-pager
 - Start, stop or restart Sunshine: $ systemctl --user restart sunshine
@@ -342,6 +346,8 @@ def segment_is_read_only(segment):
 
     if name == "ip":
         return not any(a in IP_WRITE_WORDS for a in args)
+    if name == "command":  # 'command -v X' only looks X up; 'command X' would run X
+        return len(args) >= 2 and args[0] in ("-v", "-V")
     if name == "rpm":  # only queries (rpm -qa, rpm -qf, rpm -qi ...) are read-only
         return bool(args) and (args[0].startswith("-q") or args[0] == "--query")
     if name not in READ_ONLY_COMMANDS and name not in READ_ONLY_SUBCOMMANDS:
@@ -680,6 +686,30 @@ def cpu_model():
     return platform.processor() or "unknown"
 
 
+def cpu_topology():
+    """'6 cores, 6 threads, no hyper-threading' from /proc/cpuinfo. Spelled out because,
+    told only '6 threads', the model invented hyper-threading and 12 threads."""
+    threads = os.cpu_count() or 0
+    cores = set()
+    physical = core = None
+    for line in read_text("/proc/cpuinfo").splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key == "physical id":
+            physical = value
+        elif key == "core id":
+            core = value
+        elif not key and core is not None:
+            cores.add((physical, core))
+            physical = core = None
+    if core is not None:
+        cores.add((physical, core))
+    if not cores or not threads:
+        return f"{threads} threads" if threads else ""
+    smt = "with hyper-threading" if threads > len(cores) else "no hyper-threading"
+    return f"{len(cores)} cores, {threads} threads, {smt}"
+
+
 def ram_total_gb():
     match = re.search(r"MemTotal:\s+(\d+)", read_text("/proc/meminfo"))
     return round(int(match.group(1)) * 1024 / 1e9, 1) if match else None
@@ -745,7 +775,7 @@ def machine_facts():
     ram = ram_total_gb()
     return {
         "os": f"{os_release()}, kernel {platform.release()}",
-        "cpu": f"{cpu_model()} ({os.cpu_count()} threads)",
+        "cpu": f"{cpu_model()} ({cpu_topology()})",
         "ram": f"{ram} GB" if ram else "",
         "gpus": gpu_facts(),
         "board": board(),
@@ -1111,18 +1141,103 @@ def clean_command(text):
 SUDO_USER_RE = re.compile(r"(^|&&|\|\||;)(\s*)sudo\s+(?:-\S+\s+)*((?:systemctl|journalctl)\b[^|;&\n]*?\s--user\b)")
 
 
-def normalise_command(cmd):
-    """Fix mistakes that can never work. Returns (command, list of fixes made).
+SUDO_QUERY_RE = re.compile(
+    r"(^|&&|\|\||;|\|)(\s*)sudo\s+(?:-\S+\s+)*("
+    r"(?:dnf5?)\s+(?:-\S+\s+)*(?:list|info|search|repolist|repoquery|provides|check-update|check-upgrade)\b"
+    r"|rpm\s+-q|flatpak\s+(?:list|info|search|remotes|remote-ls|history)\b)")
 
-    sudo + --user: 'sudo systemctl --user restart sunshine' talks to root's user
-    services, not yours, and fails. Both 4B and 9B made this mistake in the eval.
+
+def normalise_command(cmd):
+    """Fix mistakes that can't work or would get stuck. Returns (command, list of fixes made).
+
+    - sudo + --user: 'sudo systemctl --user restart sunshine' talks to root's user
+      services, not yours, and fails. Both 4B and 9B made this mistake in the eval.
+    - sudo on a package query ('sudo dnf search obs'): root isn't needed, and because
+      the query is read-only it would auto-run and then sit waiting for a password.
     """
     fixes = []
     head, sep, body = cmd.partition("\n") if HEREDOC_RE.search(cmd.split("\n", 1)[0]) else (cmd, "", "")
     fixed = SUDO_USER_RE.sub(r"\1\2\3", head)
     if fixed != head:
         fixes.append("dropped sudo, because --user services belong to you, not root")
-    return fixed + sep + body, fixes
+    queried = SUDO_QUERY_RE.sub(r"\1\2\3", fixed)
+    if queried != fixed:
+        fixes.append("dropped sudo, because looking up packages doesn't need root")
+    return queried + sep + body, fixes
+
+
+OVERWRITE_RE = re.compile(r"(?<![>&\d])\d?>(?![>&])\s*([^\s;&|<>]+)")
+
+
+def overwritten_files(cmd):
+    """Existing, non-empty files a command would replace with a single '>'.
+
+    The thinking model answered "add a line to my .bashrc" with cat > ~/.bashrc << EOF
+    every time, which replaces the whole file. That deserves a typed 'yes' and a warning.
+    """
+    head = command_head(cmd)
+    masked = mask_quoted(head)
+    hits = []
+    for match in OVERWRITE_RE.finditer(masked):
+        target = head[match.start(1):match.end(1)].strip("'\"")
+        if target.startswith("/dev/"):
+            continue
+        path = Path(os.path.expandvars(os.path.expanduser(target)))
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                hits.append(target)
+        except OSError:
+            continue
+    return hits
+
+
+def line_count(target):
+    try:
+        with open(os.path.expanduser(target), "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def fix_path_case(cmd):
+    """If a path in the command doesn't exist only because of its case (~/downloads for
+    ~/Downloads), return the command with the real path; otherwise None. No model needed."""
+    try:
+        words = shlex.split(command_head(cmd))
+    except ValueError:
+        return None
+    fixed = cmd
+    for word in words:
+        if "/" not in word or word.startswith("-"):
+            continue
+        expanded = os.path.expanduser(word)
+        if os.path.exists(expanded):
+            continue
+        real = _case_insensitive(expanded)
+        if real and real != expanded:
+            home = str(Path.home())
+            shown = "~" + real[len(home):] if word.startswith("~") and real.startswith(home) else real
+            fixed = fixed.replace(word, shown, 1)
+    return fixed if fixed != cmd else None
+
+
+def _case_insensitive(path):
+    parts = Path(path).parts
+    if not parts or not os.path.isabs(path):
+        return None
+    current = Path(parts[0])
+    for part in parts[1:]:
+        candidate = current / part
+        if not candidate.exists():
+            try:
+                matches = [p for p in current.iterdir() if p.name.lower() == part.lower()]
+            except OSError:
+                return None
+            if len(matches) != 1:
+                return None
+            candidate = matches[0]
+        current = candidate
+    return str(current)
 
 
 EMBEDDED_RE = re.compile(r"^\s*\$\s+(\S.*)$", re.M)
@@ -1548,6 +1663,12 @@ def approve(session, request, cmd, entry):
             return None
         if verdict == "read_only":
             return cmd, verdict
+        replaced = overwritten_files(cmd)
+        if replaced:
+            strong = True
+            reasons = [f"REPLACES the whole of {t} ({line_count(t)} lines now)" for t in replaced] + reasons
+            print(f"\n  {paint('Careful:', RED, BOLD)} this overwrites {', '.join(replaced)} instead of adding to it."
+                  + paint("  (to add a line, use >> instead of >)", DIM))
 
         print(f"\n  {paint('Needs your permission:', YELLOW, BOLD)} {explain(session, cmd)}")
         print(paint(f"  ({' · '.join(reasons)})", DIM))
@@ -1592,6 +1713,17 @@ def execute(session, request, cmd, entry, start, load_seconds, thought=False, at
             execute(session, request, fixed, {**entry, "command": fixed, "retry_of": cmd,
                                                "think": session.think != "off"},
                     start, load_seconds, thought=True, attempt=1)
+            return
+
+    # A path that's only wrong by case (~/downloads): fix it and run once more, no model needed.
+    if not interactive and attempt == 0 and code != 0 and "No such file or directory" in output:
+        fixed = fix_path_case(cmd)
+        if fixed:
+            log({**entry, "command": cmd, "decision": "ran", "auto": verdict == "read_only",
+                 "exit_code": code, "path_case": True})
+            print(paint(f"\n  ↻ That path doesn't exist, but one with different capitals does, so trying: {fixed}", DIM))
+            execute(session, request, fixed, {**entry, "command": fixed, "retry_of": cmd},
+                    start, load_seconds, thought=thought, attempt=1)
             return
 
     note = ""

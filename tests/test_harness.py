@@ -14,7 +14,7 @@ import pytest
 # ------------------------------------------------------------------ facts ----
 FACTS = {
     "os": "Fedora Linux 44 (KDE Plasma Desktop Edition), kernel 6.19.4",
-    "cpu": "Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz (6 threads)",
+    "cpu": "Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz (6 cores, 6 threads, no hyper-threading)",
     "ram": "16.7 GB",
     "gpus": ["NVIDIA GeForce RTX 2060, 6.0 GB VRAM. The NVIDIA driver 620.70.06 is installed and working"],
     "board": "ASUSTeK COMPUTER INC. PRIME B365M-A",
@@ -417,3 +417,107 @@ def test_eval_backend_uses_the_same_thinking_budget(pipeline, ai):
     FakeOllama.replies["think_chunks"] = 5
     reply = backend.chat("m", messages)
     assert reply.thought and not reply.think_fallback and len(FakeOllama.requests) == 1
+
+
+# ------------------------------------------------- overwriting existing files ----
+def test_overwrite_of_an_existing_file_is_detected(ai, tmp_path):
+    rc = tmp_path / ".bashrc"
+    rc.write_text("export PATH=$PATH:~/bin\nalias gs='git status'\n")
+    assert ai.overwritten_files(f"cat > {rc} << 'EOF'\nalias ll='ls -la'\nEOF") == [str(rc)]
+    assert ai.overwritten_files(f"sort list >{rc}") == [str(rc)]
+    assert ai.overwritten_files(f"echo x >> {rc}") == []           # appending is fine
+    assert ai.overwritten_files(f"echo x > {tmp_path}/new.txt") == []  # new file
+    assert ai.overwritten_files(f"echo '> {rc}'") == []             # inside quotes, not a redirect
+    assert ai.overwritten_files("ls 2>/dev/null") == []
+    assert ai.line_count(str(rc)) == 2
+
+
+def test_overwriting_bashrc_needs_typed_yes(pipeline, ai, monkeypatch, tmp_path, capsys):
+    rc = tmp_path / ".bashrc"
+    rc.write_text("keep me\n")
+    FakeOllama.replies = {"router": f"$ cat > {rc} << 'EOF'\nalias ll='ls -la'\nEOF"}
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")  # a plain y isn't enough
+    _, log = pipeline("add alias ll to my bashrc")
+    assert rc.read_text() == "keep me\n" and log[-1]["decision"] == "cancelled"
+    out = capsys.readouterr().out
+    assert "overwrites" in out and "REPLACES the whole of" in out
+
+
+def test_overwrite_prompt_asks_for_yes(pipeline, ai, monkeypatch, tmp_path):
+    rc = tmp_path / ".bashrc"
+    rc.write_text("keep me\n")
+    FakeOllama.replies = {"router": f"$ echo new > {rc}"}
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "")
+    pipeline("replace my bashrc")
+    assert any("type 'yes'" in p for p in prompts)
+
+
+# --------------------------------------------------------- path case fixes ----
+def test_fix_path_case(ai, tmp_path, monkeypatch):
+    (tmp_path / "Downloads" / "Music").mkdir(parents=True)
+    assert ai.fix_path_case(f"ls -lh {tmp_path}/downloads") == f"ls -lh {tmp_path}/Downloads"
+    assert ai.fix_path_case(f"ls {tmp_path}/downloads/music") == f"ls {tmp_path}/Downloads/Music"
+    assert ai.fix_path_case(f"ls {tmp_path}/Downloads") is None      # already right
+    assert ai.fix_path_case(f"ls {tmp_path}/nothing-like-it") is None
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert ai.fix_path_case("ls -lh ~/downloads") == "ls -lh ~/Downloads"  # keeps the ~ form
+
+
+def test_fix_path_case_refuses_ambiguous_matches(ai, tmp_path):
+    (tmp_path / "Notes").mkdir()
+    (tmp_path / "NOTES").mkdir()
+    assert ai.fix_path_case(f"ls {tmp_path}/notes") is None
+
+
+def test_wrong_case_path_is_fixed_and_rerun(pipeline, tmp_path):
+    (tmp_path / "Downloads").mkdir()
+    (tmp_path / "Downloads" / "song.mp3").write_text("x")
+    FakeOllama.replies = {"router": f"$ ls {tmp_path}/downloads", "summary": "One song."}
+    _, log = pipeline("what's in my downloads")
+    assert log[0]["path_case"] and log[0]["exit_code"] != 0
+    assert log[-1]["command"] == f"ls {tmp_path}/Downloads" and log[-1]["exit_code"] == 0
+
+
+# ------------------------------------------------- sudo on package queries ----
+@pytest.mark.parametrize("cmd,fixed", [
+    ("sudo dnf search --all obs", "dnf search --all obs"),
+    ("sudo rpm -qa | grep steam", "rpm -qa | grep steam"),
+    ("sudo flatpak list --app", "flatpak list --app"),
+    ("sudo dnf check-upgrade", "dnf check-upgrade"),
+])
+def test_sudo_is_dropped_from_package_queries(ai, cmd, fixed):
+    out, fixes = ai.normalise_command(cmd)
+    assert out == fixed and "doesn't need root" in fixes[0]
+
+
+@pytest.mark.parametrize("cmd", ["sudo dnf install htop", "sudo dnf remove htop", "sudo dnf upgrade --refresh",
+                                 "sudo flatpak install flathub discord", "sudo rpm -i x.rpm"])
+def test_sudo_is_kept_for_package_changes(ai, cmd):
+    assert ai.normalise_command(cmd) == (cmd, [])
+
+
+@pytest.mark.parametrize("cmd,verdict", [("command -v steam", "read_only"), ("command -V ls", "read_only"),
+                                         ("command steam", "permission"), ("command -v", "permission")])
+def test_command_v_is_read_only(ai, cmd, verdict):
+    assert ai.assess(cmd)[0] == verdict
+
+
+# --------------------------------------------------------------- cpu facts ----
+def fake_cpuinfo(cores, threads_per_core):
+    blocks = []
+    for core in range(cores):
+        for _ in range(threads_per_core):
+            blocks.append(f"processor\t: {len(blocks)}\nmodel name\t: Test CPU\nphysical id\t: 0\ncore id\t: {core}\n")
+    return "\n".join(blocks)
+
+
+@pytest.mark.parametrize("cores,tpc,expected", [
+    (6, 1, "6 cores, 6 threads, no hyper-threading"),        # i5-9400F
+    (6, 2, "6 cores, 12 threads, with hyper-threading"),      # Ryzen 5 5600X
+])
+def test_cpu_topology(ai, monkeypatch, cores, tpc, expected):
+    info = fake_cpuinfo(cores, tpc)
+    monkeypatch.setattr(ai, "read_text", lambda path: info if "cpuinfo" in str(path) else "")
+    monkeypatch.setattr(ai.os, "cpu_count", lambda: cores * tpc)
+    assert ai.cpu_topology() == expected

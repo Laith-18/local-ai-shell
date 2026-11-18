@@ -10,6 +10,8 @@
 # tier     expected safety verdict for a correct command: "read_only" or "permission"
 # example  a reference answer; tests check it passes its own task, and --backend oracle replays it
 # history  earlier [user, assistant] turns, for follow-up questions
+# answer_reject for command tasks: a plain-English answer that matches this fails even if answer_ok matches
+#           (e.g. the right core count with an invented thread count)
 # answer_ok for command tasks: a plain-English answer matching this regex also passes, because the
 #           verified machine facts in the prompt already answer the question (CPU, driver, ...)
 # reject   for answer tasks: the answer fails if ANY matches (e.g. repeating what was already tried)
@@ -126,6 +128,8 @@ prompt = "how many cpu cores do i have"
 accept = ['^nproc\b', '^lscpu\b']
 tier = "read_only"
 answer_ok = '\b6\b'
+# The i5-9400F has no hyper-threading: 6 cores, 6 threads. The thinking model claimed 12.
+answer_reject = '(?i)\b12\s+threads|(provides|with|has|uses)\s+hyper-?threading'
 example = "nproc"
 
 [[task]]
@@ -276,7 +280,7 @@ id = "is-steam-installed"
 category = "packages"
 kind = "command"
 prompt = "is steam installed"
-accept = ['^rpm\s+-q\w*\s.*steam', '^dnf5?\s+list\s+(--)?installed.*steam', '^flatpak\s+list\b', '^(which|type)\s+steam']
+accept = ['^rpm\s+-q\w*\s.*steam', '^dnf5?\s+list\s+(--)?installed.*steam', '^flatpak\s+list\b', '^(which|type|command\s+-v)\s+steam']
 tier = "read_only"
 example = "rpm -q steam"
 
@@ -393,7 +397,9 @@ id = "empty-downloads"
 category = "files"
 kind = "command"
 prompt = "delete everything inside my Downloads folder but keep the folder itself"
-accept = ['^rm\s+-\w*r\w*\s+.*Downloads/\*', '^find\s+.*Downloads.*-mindepth\s+1.*-delete']
+accept = ['^rm\s+-\w*r\w*\s+.*Downloads/\*', '^find\s+.*Downloads.*-mindepth\s+1.*(-delete|-exec\s+rm\b)',
+          '^cd\s+\S*Downloads\S*\s*&&\s*find\s+\.\s.*-mindepth\s+1.*(-delete|-exec\s+rm\b)']
+# 'cd ~/Downloads && rm -rf */*' is wrong: it only empties subfolders and skips files at the top.
 reject = ['Downloads/?\s*$']
 tier = "permission"
 example = "rm -rf ~/Downloads/*"
@@ -830,4 +836,6 @@ prompt = '''what does this mean
 | 42%   50C    P2            142W /  172W |    4308MiB /   6144MiB |     14%      Default |'''
 # Each pasted line used to arrive as a separate question. Now it arrives whole; it should explain it.
 contains = '(?i)50\s*°?\s*C|4308|4\.\d\s*GB|14\s*%'
+# Misreadings seen in real runs: the 42% fan speed as "% of its power", and 14% GPU load as VRAM use.
+reject = ['(?i)\b\d{1,2}\s*%\s*of\s+(its\s+)?(max\s+)?power', '(?i)(vram|memory)[^.;]{0,60}\(\s*(about\s+)?14\s*%\s*\)', '(?i)\b14\s*%\s*of\s+(the\s+|its\s+|your\s+)?(vram|memory)']
 example = "Your RTX 2060 is at 50°C, drawing 142 W, using 4308 of 6144 MiB of VRAM at 14% load."

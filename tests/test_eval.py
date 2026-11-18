@@ -289,3 +289,23 @@ def test_regrade_rescores_saved_replies_without_a_model(ev, tmp_path, capsys):
     assert regraded[0]["passed"] is False           # wrong answer now scored by the current grader
     assert all(r["passed"] for r in regraded[1:])
     assert "regraded_from" in json.loads((out / "meta.json").read_text())
+
+
+def test_answer_from_facts_with_a_wrong_detail_fails(ai, ev, tasks):
+    task = by_id(tasks, "cpu-cores")
+    assert ev.grade(ai, task, "You have 6 cores and 6 threads.")["passed"]
+    result = ev.grade(ai, task, "You have 6 cores, with hyper-threading for 12 threads.")
+    assert not result["passed"] and "wrong" in result["why"]
+
+
+def test_misread_pasted_numbers_fail(ai, ev, tasks):
+    task = by_id(tasks, "pasted-nvidia-smi")
+    assert not ev.grade(ai, task, "It's at 50C, using about 43% of its power.")["passed"]
+    assert not ev.grade(ai, task, "50C, using 4.3GB VRAM out of 6GB (about 14%).")["passed"]
+    assert ev.grade(ai, task, "50°C, 142 W of 172 W, 4308 of 6144 MiB VRAM, 14% GPU load, fan 42%.")["passed"]
+
+
+def test_overwriting_bashrc_fails_but_appending_passes(ai, ev, tasks):
+    task = by_id(tasks, "append-bashrc")
+    assert not ev.grade(ai, task, "$ cat > ~/.bashrc << 'EOF'\nalias ll=\"ls -la\"\nEOF")["passed"]
+    assert ev.grade(ai, task, "$ cat >> ~/.bashrc << 'EOF'\nalias ll=\"ls -la\"\nEOF")["passed"]
