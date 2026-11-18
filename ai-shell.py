@@ -65,8 +65,11 @@ SUMMARY_INPUT_CHARS = 4000   # how much command output the model gets to read
 HISTORY_MESSAGES = 10        # remembered messages for follow-up questions
 NUM_CTX = int(os.environ.get("AI_SHELL_NUM_CTX", "8192"))  # context window; Ollama's default is smaller
 THINK_MODES = ("off", "auto", "on")
-DEFAULT_THINK = os.environ.get("AI_SHELL_THINK", "auto")
-THINK_TOKENS = 3000          # extra token budget when the model reasons before answering
+DEFAULT_THINK = os.environ.get("AI_SHELL_THINK", "on")
+# Reasoning first made qwen3.5:4b far more accurate (81.6% -> 89.7% on the eval), but a few
+# replies thought for 2,000-3,900 tokens (up to a minute) and one ran out and said nothing.
+# So thinking gets a budget: past it, ai-shell stops and asks again without thinking.
+THINK_BUDGET = int(os.environ.get("AI_SHELL_THINK_BUDGET", "1000"))  # ~17 s at 60 tok/s
 HELP_TEXT_CHARS = 2500       # how much --help output the model gets when fixing a command
 PASTE_WINDOW = 0.05          # seconds: lines arriving this close together are one paste
 
@@ -86,8 +89,9 @@ Decide what the user needs:
 - Otherwise, if answering needs information from this computer, or they want something done on it, reply with ONE line: "$ " followed by a single shell command. Nothing else.
 - Never guess facts about this computer, the current date or the time: use the verified facts or a command (e.g. $ date).
 - If it is a general question that isn't about this machine, answer in plain English in 1-4 short sentences. No markdown.
-- If the user pastes command output, explain what it shows; don't re-run the command unless they ask.
+- If the user pastes command output, explain what it shows; don't re-run the command unless they ask. Only quote numbers that appear in it, with the label they appear under (e.g. "Fan 42%" is the fan, not power).
 - If the user says they've already tried or done something, don't suggest it again: suggest different things, or say you're out of ideas.
+- Never tell the user to run a command, or ask whether you should: if a command answers the question, reply with that command and ai-shell runs it.
 
 About you: you are the {model} model, running entirely on this computer's own GPU through Ollama, so nothing the user asks leaves the machine (the computer itself can still be online: see the facts). The first reply after a break takes a few seconds longer while the model loads. You are far smaller and less capable than big cloud chatbots like Claude or ChatGPT, but you are private and free. Each reply shows its speed underneath. That speed is normal for a local model of your size on this GPU: it is set mainly by the model's size and the GPU's memory bandwidth. Don't invent other explanations, and don't make claims about how fast other AI services are.
 
@@ -98,15 +102,19 @@ Command rules:
 - Don't pipe into head or tail unless the user asks for a top N or the last N lines; ai-shell already shortens long output.
 - Only use programs listed as installed, or common core tools. Never invent programs or options.
 - Never use commands that wait for keyboard input, such as cat with no file.
-- To write a file, use a heredoc: the first line is $ cat > /path/to/file << 'EOF' then the file's
-  content on the following lines, then EOF alone on the last line. This is the only time you may
-  reply with more than one line.
+- To ADD a line to an existing file, append with >>, e.g. $ echo 'alias ll="ls -la"' >> ~/.bashrc
+  A single > REPLACES the whole file, so never use > on a file that already exists (like ~/.bashrc) unless the user asks to replace it.
+- To create a new file, use a heredoc: the first line is $ cat > /path/to/file << 'EOF' then the file's
+  content on the following lines, then EOF alone on the last line (use cat >> to append several lines).
+  This is the only time you may reply with more than one line.
 - Install software with dnf, e.g. $ sudo dnf install htop
 - GUI apps can also come from Flathub, e.g. $ flatpak install flathub discord
 - Never remove the NVIDIA driver (akmod-nvidia) or kernel packages unless the user asks for exactly that.
 - Containers use podman, not docker.
-- Sunshine runs as a systemd user service named exactly "sunshine": manage it with systemctl --user <action> sunshine
-- Ollama runs as a system service named "ollama": manage it with sudo systemctl <action> ollama
+- Sunshine runs as a systemd USER service named exactly "sunshine": always add --user (systemctl --user, journalctl --user) and never sudo.
+- Ollama runs as a SYSTEM service named "ollama": no --user; sudo only to change it (start, stop, restart).
+- Never combine sudo with --user: it targets root's services, not yours, and fails.
+- "it", "that" and "this" mean the one thing just discussed. Act on that one thing only.
 - Only use sudo when actually required.
 
 {fedora_rules}
@@ -125,6 +133,14 @@ Known-good commands. When one fits the request, use it exactly:
 - Temperatures: $ sensors
 - Local AI models: $ ollama list   (loaded right now: $ ollama ps)
 - Is the internet working right now: $ ping -c 3 1.1.1.1
+- How long the computer has been on: $ uptime -p
+- Is a program running: $ pgrep -a firefox
+- Empty a folder but keep the folder itself: $ find ~/Downloads -mindepth 1 -delete
+- Kernel messages: $ journalctl -k -n 50 --no-pager
+- Sunshine status / logs: $ systemctl --user status sunshine   /   $ journalctl --user -u sunshine -n 50 --no-pager
+- Start, stop or restart Sunshine: $ systemctl --user restart sunshine
+- Ollama status / logs: $ systemctl status ollama   /   $ journalctl -u ollama -n 50 --no-pager
+- Start, stop or restart Ollama: $ sudo systemctl restart ollama
 
 Things the user has taught you. Always follow these; they override everything above:
 {memories}
@@ -330,6 +346,8 @@ def segment_is_read_only(segment):
 
     if name == "ip":
         return not any(a in IP_WRITE_WORDS for a in args)
+    if name == "command":  # 'command -v X' only looks X up; 'command X' would run X
+        return len(args) >= 2 and args[0] in ("-v", "-V")
     if name == "rpm":  # only queries (rpm -qa, rpm -qf, rpm -qi ...) are read-only
         return bool(args) and (args[0].startswith("-q") or args[0] == "--query")
     if name not in READ_ONLY_COMMANDS and name not in READ_ONLY_SUBCOMMANDS:
@@ -458,17 +476,36 @@ def get_json(path, timeout=1.5):
         return json.load(resp)
 
 
-def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinking=None):
+class ThinkingTooLong(Exception):
+    pass
+
+
+def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinking=None, on_fallback=None):
     """Yield (text_piece, final_stats_or_None) as the model generates.
 
     With think=True the model reasons first. Ollama sends that reasoning separately
     (message.thinking), so it never reaches the reply text; on_thinking() is called
-    while it happens so the spinner can say so.
+    while it happens so the spinner can say so. If the reasoning runs past THINK_BUDGET
+    tokens before any reply text, the request is dropped and asked again without
+    thinking; the final stats then carry think_fallback=True.
     """
+    if not think:
+        yield from _chat_stream(model, messages, keep_alive, num_predict, False, None)
+        return
+    try:
+        yield from _chat_stream(model, messages, keep_alive, num_predict, True, on_thinking)
+    except ThinkingTooLong:
+        if on_fallback:
+            on_fallback()
+        for piece, done in _chat_stream(model, messages, keep_alive, num_predict, False, None):
+            yield piece, ({**done, "think_fallback": True} if done is not None else None)
+
+
+def _chat_stream(model, messages, keep_alive, num_predict, think, on_thinking):
     payload = {
         "model": model, "messages": messages, "stream": True, "think": think,
         "keep_alive": keep_alive,
-        "options": {"temperature": 0, "num_predict": num_predict + (THINK_TOKENS if think else 0),
+        "options": {"temperature": 0, "num_predict": num_predict + (THINK_BUDGET + 50 if think else 0),
                     "repeat_penalty": 1.1, "num_ctx": NUM_CTX},
     }
     try:
@@ -479,6 +516,7 @@ def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinki
             raise OllamaError(body.strip() or str(e)) from e
         payload.pop("think")  # model doesn't support the think flag
         resp = _post("/api/chat", payload)
+    thought, replied = 0, False
     with resp:
         for raw in resp:
             if not raw.strip():
@@ -488,8 +526,13 @@ def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinki
                 raise OllamaError(data["error"])
             message = data.get("message") or {}
             piece = message.get("content") or ""
-            if message.get("thinking") and on_thinking:
-                on_thinking()
+            if message.get("thinking"):
+                thought += 1  # Ollama streams roughly one token per chunk
+                if on_thinking:
+                    on_thinking()
+                if think and not replied and thought > THINK_BUDGET:
+                    raise ThinkingTooLong()  # leaving the with block closes the connection
+            replied = replied or bool(piece.strip())
             if data.get("done"):
                 yield piece, data
                 return
@@ -520,11 +563,17 @@ class Spinner:
     def __init__(self, text):
         self.text = text
         self.thinking = False  # set once the model starts reasoning, so a pause isn't blamed on loading
+        self.fell_back = False
         self._stop = threading.Event()
         self._thread = None
 
     def mark_thinking(self):
         self.thinking = True
+
+    def mark_fallback(self):
+        self.thinking = False
+        self.text = "thinking took too long, answering directly"
+        self.fell_back = True
 
     def start(self):
         if TTY:
@@ -539,7 +588,7 @@ class Spinner:
             if self.thinking:
                 text = "thinking it through"
             else:
-                text = self.text if elapsed < 3 else "loading the model (slower after a break)"
+                text = self.text if elapsed < 3 or self.fell_back else "loading the model (slower after a break)"
             sys.stdout.write(f"\r  {paint(self.FRAMES[i % len(self.FRAMES)], MAGENTA)} "
                              f"{paint(f'{text}… {elapsed:.0f}s', DIM)}\033[K")
             sys.stdout.flush()
@@ -592,7 +641,9 @@ def footer(seconds, load_seconds, final=None, thought=False):
     final = final or {}
     if final.get("eval_duration") and (final.get("eval_count") or 0) >= 5:
         parts.append(f"{final['eval_count'] / (final['eval_duration'] / 1e9):.0f} tok/s")
-    if thought:
+    if thought == "fallback" or final.get("think_fallback"):
+        parts.append("thinking took too long, so it answered directly")
+    elif thought:
         parts.append("thought it through first")
     if load_seconds > 1.5:
         parts.append(f"{load_seconds:.1f}s of that was loading the model")
@@ -633,6 +684,30 @@ def cpu_model():
         if line.lower().startswith("model name"):
             return re.sub(r"\s+", " ", line.split(":", 1)[1]).strip()
     return platform.processor() or "unknown"
+
+
+def cpu_topology():
+    """'6 cores, 6 threads, no hyper-threading' from /proc/cpuinfo. Spelled out because,
+    told only '6 threads', the model invented hyper-threading and 12 threads."""
+    threads = os.cpu_count() or 0
+    cores = set()
+    physical = core = None
+    for line in read_text("/proc/cpuinfo").splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key == "physical id":
+            physical = value
+        elif key == "core id":
+            core = value
+        elif not key and core is not None:
+            cores.add((physical, core))
+            physical = core = None
+    if core is not None:
+        cores.add((physical, core))
+    if not cores or not threads:
+        return f"{threads} threads" if threads else ""
+    smt = "with hyper-threading" if threads > len(cores) else "no hyper-threading"
+    return f"{len(cores)} cores, {threads} threads, {smt}"
 
 
 def ram_total_gb():
@@ -700,7 +775,7 @@ def machine_facts():
     ram = ram_total_gb()
     return {
         "os": f"{os_release()}, kernel {platform.release()}",
-        "cpu": f"{cpu_model()} ({os.cpu_count()} threads)",
+        "cpu": f"{cpu_model()} ({cpu_topology()})",
         "ram": f"{ram} GB" if ram else "",
         "gpus": gpu_facts(),
         "board": board(),
@@ -886,7 +961,7 @@ HELP = """
   clear       clear the screen
   /learned    list everything I've learned     /unlearn <n>   forget one
   /forget     forget this conversation          /raw           show or hide raw output
-  /think      off · auto · on (auto: reason first for "why…" and troubleshooting questions)
+  /think      on · auto · off (on by default: reasons first, up to a budget, then answers directly)
   /facts      show what I know about this machine
   /stats      show the system stats again       exit           quit and free the GPU
 """
@@ -1061,6 +1136,125 @@ def clean_command(text):
             break
         body.append(line.rstrip())
     return "\n".join([first, *body, end])
+
+
+SUDO_USER_RE = re.compile(r"(^|&&|\|\||;)(\s*)sudo\s+(?:-\S+\s+)*((?:systemctl|journalctl)\b[^|;&\n]*?\s--user\b)")
+
+
+SUDO_QUERY_RE = re.compile(
+    r"(^|&&|\|\||;|\|)(\s*)sudo\s+(?:-\S+\s+)*("
+    r"(?:dnf5?)\s+(?:-\S+\s+)*(?:list|info|search|repolist|repoquery|provides|check-update|check-upgrade)\b"
+    r"|rpm\s+-q|flatpak\s+(?:list|info|search|remotes|remote-ls|history)\b)")
+
+
+def normalise_command(cmd):
+    """Fix mistakes that can't work or would get stuck. Returns (command, list of fixes made).
+
+    - sudo + --user: 'sudo systemctl --user restart sunshine' talks to root's user
+      services, not yours, and fails. Both 4B and 9B made this mistake in the eval.
+    - sudo on a package query ('sudo dnf search obs'): root isn't needed, and because
+      the query is read-only it would auto-run and then sit waiting for a password.
+    """
+    fixes = []
+    head, sep, body = cmd.partition("\n") if HEREDOC_RE.search(cmd.split("\n", 1)[0]) else (cmd, "", "")
+    fixed = SUDO_USER_RE.sub(r"\1\2\3", head)
+    if fixed != head:
+        fixes.append("dropped sudo, because --user services belong to you, not root")
+    queried = SUDO_QUERY_RE.sub(r"\1\2\3", fixed)
+    if queried != fixed:
+        fixes.append("dropped sudo, because looking up packages doesn't need root")
+    return queried + sep + body, fixes
+
+
+OVERWRITE_RE = re.compile(r"(?<![>&\d])\d?>(?![>&])\s*([^\s;&|<>]+)")
+
+
+def overwritten_files(cmd):
+    """Existing, non-empty files a command would replace with a single '>'.
+
+    The thinking model answered "add a line to my .bashrc" with cat > ~/.bashrc << EOF
+    every time, which replaces the whole file. That deserves a typed 'yes' and a warning.
+    """
+    head = command_head(cmd)
+    masked = mask_quoted(head)
+    hits = []
+    for match in OVERWRITE_RE.finditer(masked):
+        target = head[match.start(1):match.end(1)].strip("'\"")
+        if target.startswith("/dev/"):
+            continue
+        path = Path(os.path.expandvars(os.path.expanduser(target)))
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                hits.append(target)
+        except OSError:
+            continue
+    return hits
+
+
+def line_count(target):
+    try:
+        with open(os.path.expanduser(target), "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def fix_path_case(cmd):
+    """If a path in the command doesn't exist only because of its case (~/downloads for
+    ~/Downloads), return the command with the real path; otherwise None. No model needed."""
+    try:
+        words = shlex.split(command_head(cmd))
+    except ValueError:
+        return None
+    fixed = cmd
+    for word in words:
+        if "/" not in word or word.startswith("-"):
+            continue
+        expanded = os.path.expanduser(word)
+        if os.path.exists(expanded):
+            continue
+        real = _case_insensitive(expanded)
+        if real and real != expanded:
+            home = str(Path.home())
+            shown = "~" + real[len(home):] if word.startswith("~") and real.startswith(home) else real
+            fixed = fixed.replace(word, shown, 1)
+    return fixed if fixed != cmd else None
+
+
+def _case_insensitive(path):
+    parts = Path(path).parts
+    if not parts or not os.path.isabs(path):
+        return None
+    current = Path(parts[0])
+    for part in parts[1:]:
+        candidate = current / part
+        if not candidate.exists():
+            try:
+                matches = [p for p in current.iterdir() if p.name.lower() == part.lower()]
+            except OSError:
+                return None
+            if len(matches) != 1:
+                return None
+            candidate = matches[0]
+        current = candidate
+    return str(current)
+
+
+EMBEDDED_RE = re.compile(r"^\s*\$\s+(\S.*)$", re.M)
+
+
+def embedded_command(text):
+    """A reply that's prose plus one '$ command' line: return that command, else None.
+
+    The model sometimes answers "Run this: $ sudo systemctl enable --now sshd" instead of
+    replying with just the command, and then nothing ran. Exactly one such line is needed,
+    so a list of options isn't mistaken for a single action.
+    """
+    lines = EMBEDDED_RE.findall(re.sub(r"```[\w-]*", "", text))
+    if len(lines) != 1:
+        return None
+    cmd = lines[0].strip().strip("`").strip()
+    return cmd if cmd and len(cmd) <= MAX_COMMAND_CHARS and not HEREDOC_RE.search(cmd) else None
 
 
 def command_head(cmd):
@@ -1348,7 +1542,7 @@ def fix_command(session, request, cmd, output):
         spinner.stop()
     if decide(text, True) != "command":
         return None
-    fixed = clean_command(text)
+    fixed, _ = normalise_command(clean_command(text))
     if not fixed or fixed == cmd or "\n" in fixed or len(fixed) > MAX_COMMAND_CHARS:
         return None
     return fixed
@@ -1366,7 +1560,8 @@ def handle(session, request):
     buffer, mode, final, out = "", None, {}, Streamer()
     try:
         for piece, done in chat_stream(session.model, router_messages(session, request), session.keep_alive,
-                                       MAX_REPLY_TOKENS, think=think, on_thinking=spinner.mark_thinking):
+                                       MAX_REPLY_TOKENS, think=think, on_thinking=spinner.mark_thinking,
+                                       on_fallback=spinner.mark_fallback):
             buffer += piece
             final = done or final
             if mode is None:
@@ -1394,6 +1589,8 @@ def handle(session, request):
     session.used_model = True
     load_seconds = (final.get("load_duration") or 0) / 1e9
     mode = mode or decide(buffer, True)
+    if final.get("think_fallback"):
+        think = "fallback"
 
     if mode == "answer":
         out.end()
@@ -1402,6 +1599,9 @@ def handle(session, request):
         footer(time.monotonic() - start, load_seconds, final, thought=think)
         session.remember(request, buffer.strip())
         log({"model": session.model, "request": request, "decision": "answered", "think": think})
+        offered = embedded_command(buffer)
+        if offered and sys.stdin.isatty():
+            offer_embedded(session, request, offered, think)
         return
 
     cmd = clean_command(buffer)
@@ -1413,7 +1613,28 @@ def handle(session, request):
         footer(time.monotonic() - start, load_seconds)
         log({**entry, "command": cmd[:200], "decision": "runaway"})
         return
+    cmd, fixes = normalise_command(cmd)
+    if fixes:
+        entry.update(command=cmd, fixed=fixes, model_command=entry["command"])
+        print(paint(f"\n  (fixed the model's command: {'; '.join(fixes)})", DIM))
     execute(session, request, cmd, entry, start, load_seconds, thought=think)
+
+
+def offer_embedded(session, request, cmd, think):
+    """The answer included one command: offer to run it, through the usual safety checks."""
+    cmd, fixes = normalise_command(cmd)
+    try:
+        answer = input(f"\n  {paint('Run that command?', MAGENTA)} {paint(cmd, CYAN)}  y/N: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer not in ("y", "yes"):
+        return
+    for fix in fixes:
+        print(paint(f"  (fixed: {fix})", DIM))
+    entry = {"model": session.model, "request": request, "command": cmd, "think": think, "offered": True}
+    # Read-only commands run straight away (you just said yes); anything else still asks.
+    execute(session, request, cmd, entry, time.monotonic(), 0.0)
 
 
 def approve(session, request, cmd, entry):
@@ -1442,6 +1663,12 @@ def approve(session, request, cmd, entry):
             return None
         if verdict == "read_only":
             return cmd, verdict
+        replaced = overwritten_files(cmd)
+        if replaced:
+            strong = True
+            reasons = [f"REPLACES the whole of {t} ({line_count(t)} lines now)" for t in replaced] + reasons
+            print(f"\n  {paint('Careful:', RED, BOLD)} this overwrites {', '.join(replaced)} instead of adding to it."
+                  + paint("  (to add a line, use >> instead of >)", DIM))
 
         print(f"\n  {paint('Needs your permission:', YELLOW, BOLD)} {explain(session, cmd)}")
         print(paint(f"  ({' · '.join(reasons)})", DIM))
@@ -1486,6 +1713,17 @@ def execute(session, request, cmd, entry, start, load_seconds, thought=False, at
             execute(session, request, fixed, {**entry, "command": fixed, "retry_of": cmd,
                                                "think": session.think != "off"},
                     start, load_seconds, thought=True, attempt=1)
+            return
+
+    # A path that's only wrong by case (~/downloads): fix it and run once more, no model needed.
+    if not interactive and attempt == 0 and code != 0 and "No such file or directory" in output:
+        fixed = fix_path_case(cmd)
+        if fixed:
+            log({**entry, "command": cmd, "decision": "ran", "auto": verdict == "read_only",
+                 "exit_code": code, "path_case": True})
+            print(paint(f"\n  ↻ That path doesn't exist, but one with different capitals does, so trying: {fixed}", DIM))
+            execute(session, request, fixed, {**entry, "command": fixed, "retry_of": cmd},
+                    start, load_seconds, thought=thought, attempt=1)
             return
 
     note = ""
@@ -1568,9 +1806,10 @@ def set_think(session, arg):
     elif arg:
         print(paint("  Use /think off, /think auto or /think on.", DIM))
         return
-    detail = {"off": "never reason first (fastest)",
+    detail = {"off": "never reason first (fastest, least accurate)",
               "auto": "reason first for 'why…', troubleshooting and comparison questions, and when fixing a command",
-              "on": "always reason first (slower, more careful)"}[session.think]
+              "on": f"always reason first, for up to {THINK_BUDGET} tokens, then answer directly (most accurate)"
+              }[session.think]
     print(paint(f"  Thinking is {session.think}: {detail}.", DIM))
 
 

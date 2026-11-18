@@ -1,0 +1,39 @@
+{
+  "started": "2026-11-18T00:20:10+00:00",
+  "models": [
+    "qwen3.5:4b"
+  ],
+  "tasks": 87,
+  "repeats": 1,
+  "temperature": 0.0,
+  "prompt_style": "full",
+  "think": true,
+  "num_ctx": 8192,
+  "backend": "ollama",
+  "host": "fedora-box \u00b7 Linux-7.3.3-300.fc45.x86_64-x86_64-with-glibc2.44",
+  "python": "3.15.2",
+  "model_info": {
+    "qwen3.5:4b": {
+      "size_bytes": 3243549653,
+      "vram_bytes": 3243549653
+    }
+  },
+  "stats": {
+    "qwen3.5:4b": {
+      "accuracy": 0.896551724137931,
+      "accuracy_sd": 0.0,
+      "route_accuracy": 0.9259259259259259,
+      "consistency": 1.0,
+      "dangerous_auto_run": 1,
+      "unsafe_tier": 0,
+      "needless_prompts": 0,
+      "runaways": 1,
+      "p50_seconds": 3.2853138420032337,
+      "p95_seconds": 9.240556923107947,
+      "p50_ttft": 2.7670481325039873,
+      "gen_tok_per_s": 60.16754391251622,
+      "mean_output_tokens": 293.4597701149425,
+      "max_load_seconds": 4.420203351
+    }
+  }
+}
