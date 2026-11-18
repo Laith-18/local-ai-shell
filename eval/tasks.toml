@@ -837,5 +837,6 @@ prompt = '''what does this mean
 # Each pasted line used to arrive as a separate question. Now it arrives whole; it should explain it.
 contains = '(?i)50\s*°?\s*C|4308|4\.\d\s*GB|14\s*%'
 # Misreadings seen in real runs: the 42% fan speed as "% of its power", and 14% GPU load as VRAM use.
-reject = ['(?i)\b\d{1,2}\s*%\s*of\s+(its\s+)?(max\s+)?power', '(?i)(vram|memory)[^.;]{0,60}\(\s*(about\s+)?14\s*%\s*\)', '(?i)\b14\s*%\s*of\s+(the\s+|its\s+|your\s+)?(vram|memory)']
+reject = ['(?i)\b\d{1,2}\s*%\s*of\s+(its\s+)?(max\s+)?power',
+          '(?i)\b42\s*%\s*(gpu\s+)?(usage|utili[sz]ation|load)|(usage|utili[sz]ation|load)\s+(at|of|is)\s+42\s*%', '(?i)(vram|memory)[^.;]{0,60}\(\s*(about\s+)?14\s*%\s*\)', '(?i)\b14\s*%\s*of\s+(the\s+|its\s+|your\s+)?(vram|memory)']
 example = "Your RTX 2060 is at 50°C, drawing 142 W, using 4308 of 6144 MiB of VRAM at 14% load."
