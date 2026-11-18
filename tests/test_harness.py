@@ -168,7 +168,7 @@ def test_should_think(ai, mode, request_text, expected):
 
 def test_set_think(ai, capsys):
     session = ai.Session("m", "1m")
-    assert session.think == "auto"
+    assert session.think == "on"  # the default since the eval: 81.6% -> 89.7% with thinking
     ai.set_think(session, "off")
     assert session.think == "off"
     ai.set_think(session, "banana")
@@ -220,6 +220,12 @@ class FakeOllama(http.server.BaseHTTPRequestHandler):
             text = FakeOllama.replies.get("summary", "Summary.")
         self.send_response(200)
         self.end_headers()
+        if body.get("think"):
+            for _ in range(FakeOllama.replies.get("think_chunks", 3)):
+                try:
+                    self.wfile.write((json.dumps({"message": {"thinking": "hmm "}, "done": False}) + "\n").encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    return  # the client gave up thinking, as it should past the budget
         for chunk in ({"message": {"content": text}, "done": False},
                       {"message": {"content": ""}, "done": True, "eval_count": 3, "eval_duration": 10**8}):
             self.wfile.write((json.dumps(chunk) + "\n").encode())
@@ -315,4 +321,99 @@ def test_diagnostic_question_thinks_with_a_bigger_budget(pipeline, ai):
     pipeline("why is it so fast")
     sent = FakeOllama.requests[0]
     assert sent["think"] is True
-    assert sent["options"]["num_predict"] == ai.MAX_REPLY_TOKENS + ai.THINK_TOKENS
+    assert sent["options"]["num_predict"] == ai.MAX_REPLY_TOKENS + ai.THINK_BUDGET + 50
+
+
+# ---------------------------------------------------------- thinking budget ----
+def test_thinking_past_the_budget_is_asked_again_without_thinking(pipeline, ai, monkeypatch, capsys):
+    monkeypatch.setattr(ai, "THINK_BUDGET", 20)
+    FakeOllama.replies = {"router": "Tokyo is the capital of Japan.", "think_chunks": 500}
+    session, log = pipeline("why is tokyo the capital")  # 'why' -> thinks in auto mode
+    assert [r["think"] for r in FakeOllama.requests] == [True, False]
+    out = capsys.readouterr().out
+    assert "Tokyo is the capital" in out and "thinking took too long" in out
+    assert log[-1]["think"] == "fallback"
+
+
+def test_thinking_within_the_budget_is_kept(pipeline, ai, monkeypatch, capsys):
+    monkeypatch.setattr(ai, "THINK_BUDGET", 20)
+    FakeOllama.replies = {"router": "Because it is.", "think_chunks": 5}
+    pipeline("why is the sky blue")
+    assert [r["think"] for r in FakeOllama.requests] == [True]
+    assert "thought it through first" in capsys.readouterr().out
+
+
+# ------------------------------------------------- commands that can't work ----
+@pytest.mark.parametrize("cmd,fixed", [
+    ("sudo systemctl --user restart sunshine", "systemctl --user restart sunshine"),
+    ("sudo systemctl restart --user sunshine", "systemctl restart --user sunshine"),
+    ("sudo -n journalctl --user -u sunshine -n 50", "journalctl --user -u sunshine -n 50"),
+    ("sudo systemctl start ollama && sudo systemctl --user start sunshine",
+     "sudo systemctl start ollama && systemctl --user start sunshine"),
+])
+def test_sudo_is_dropped_from_user_services(ai, cmd, fixed):
+    assert ai.normalise_command(cmd)[0] == fixed
+    assert ai.normalise_command(cmd)[1]
+
+
+@pytest.mark.parametrize("cmd", ["sudo systemctl restart ollama", "systemctl --user status sunshine",
+                                 "echo 'sudo systemctl --user x'", "sudo -u laith systemctl --user status x"])
+def test_other_commands_are_left_alone(ai, cmd):
+    assert ai.normalise_command(cmd) == (cmd, [])
+
+
+def test_router_command_with_sudo_and_user_is_fixed_before_running(pipeline, capsys):
+    FakeOllama.replies = {"router": "$ sudo systemctl --user status definitely-not-a-unit"}
+    _, log = pipeline("is my unit running")
+    assert log[-1]["command"] == "systemctl --user status definitely-not-a-unit"
+    assert log[-1]["model_command"].startswith("sudo ")
+    assert "dropped sudo" in capsys.readouterr().out
+
+
+# --------------------------------------------------- command inside answers ----
+@pytest.mark.parametrize("text,cmd", [
+    ("To make SSH start at boot:\n\n$ sudo systemctl enable --now sshd", "sudo systemctl enable --now sshd"),
+    ("Run this:\n```bash\n$ ss -tulpn\n```", "ss -tulpn"),
+    ("Try one of these:\n$ htop\n$ btop", None),     # a list of options isn't one action
+    ("You can check with $ nvidia-smi anytime.", None),  # inline mention, not a command line
+    ("Paris is the capital of France.", None),
+])
+def test_embedded_command(ai, text, cmd):
+    assert ai.embedded_command(text) == cmd
+
+
+def test_command_inside_an_answer_is_offered_and_runs_on_yes(pipeline, ai, monkeypatch, capsys):
+    FakeOllama.replies = {"router": "Here's how to list the temp folder:\n\n$ ls -d /tmp", "summary": "It exists."}
+    monkeypatch.setattr(ai.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    _, log = pipeline("how do i see the temp folder")
+    assert log[-1]["offered"] and log[-1]["command"] == "ls -d /tmp" and log[-1]["exit_code"] == 0
+    assert kinds(FakeOllama.requests) == ["router", "summary"]
+
+
+def test_command_inside_an_answer_is_not_run_on_no(pipeline, ai, monkeypatch):
+    FakeOllama.replies = {"router": "Here's how:\n\n$ ls -d /tmp"}
+    monkeypatch.setattr(ai.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    _, log = pipeline("how do i see the temp folder")
+    assert [e["decision"] for e in log] == ["answered"]
+
+
+def test_eval_backend_uses_the_same_thinking_budget(pipeline, ai):
+    import importlib.util
+
+    from conftest import ROOT
+    spec = importlib.util.spec_from_file_location("run_eval", ROOT / "eval" / "run_eval.py")
+    ev = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ev)
+    backend = ev.OllamaBackend(ai.OLLAMA_URL, think="on", think_budget=20)
+    FakeOllama.replies = {"router": "$ df -h", "think_chunks": 500}
+    messages = [{"role": "system", "content": "You are ai-shell, a friendly assistant"},
+                {"role": "user", "content": "how much storage"}]
+    reply = backend.chat("m", messages)
+    assert reply.text == "$ df -h" and reply.think_fallback and not reply.thought
+    assert [r["think"] for r in FakeOllama.requests] == [True, False]
+    FakeOllama.requests.clear()
+    FakeOllama.replies["think_chunks"] = 5
+    reply = backend.chat("m", messages)
+    assert reply.thought and not reply.think_fallback and len(FakeOllama.requests) == 1

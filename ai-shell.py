@@ -65,8 +65,11 @@ SUMMARY_INPUT_CHARS = 4000   # how much command output the model gets to read
 HISTORY_MESSAGES = 10        # remembered messages for follow-up questions
 NUM_CTX = int(os.environ.get("AI_SHELL_NUM_CTX", "8192"))  # context window; Ollama's default is smaller
 THINK_MODES = ("off", "auto", "on")
-DEFAULT_THINK = os.environ.get("AI_SHELL_THINK", "auto")
-THINK_TOKENS = 3000          # extra token budget when the model reasons before answering
+DEFAULT_THINK = os.environ.get("AI_SHELL_THINK", "on")
+# Reasoning first made qwen3.5:4b far more accurate (81.6% -> 89.7% on the eval), but a few
+# replies thought for 2,000-3,900 tokens (up to a minute) and one ran out and said nothing.
+# So thinking gets a budget: past it, ai-shell stops and asks again without thinking.
+THINK_BUDGET = int(os.environ.get("AI_SHELL_THINK_BUDGET", "1000"))  # ~17 s at 60 tok/s
 HELP_TEXT_CHARS = 2500       # how much --help output the model gets when fixing a command
 PASTE_WINDOW = 0.05          # seconds: lines arriving this close together are one paste
 
@@ -105,8 +108,10 @@ Command rules:
 - GUI apps can also come from Flathub, e.g. $ flatpak install flathub discord
 - Never remove the NVIDIA driver (akmod-nvidia) or kernel packages unless the user asks for exactly that.
 - Containers use podman, not docker.
-- Sunshine runs as a systemd user service named exactly "sunshine": manage it with systemctl --user <action> sunshine
-- Ollama runs as a system service named "ollama": manage it with sudo systemctl <action> ollama
+- Sunshine runs as a systemd USER service named exactly "sunshine": always add --user (systemctl --user, journalctl --user) and never sudo.
+- Ollama runs as a SYSTEM service named "ollama": no --user; sudo only to change it (start, stop, restart).
+- Never combine sudo with --user: it targets root's services, not yours, and fails.
+- "it", "that" and "this" mean the one thing just discussed. Act on that one thing only.
 - Only use sudo when actually required.
 
 {fedora_rules}
@@ -125,6 +130,13 @@ Known-good commands. When one fits the request, use it exactly:
 - Temperatures: $ sensors
 - Local AI models: $ ollama list   (loaded right now: $ ollama ps)
 - Is the internet working right now: $ ping -c 3 1.1.1.1
+- How long the computer has been on: $ uptime -p
+- Is a program running: $ pgrep -a firefox
+- Kernel messages: $ journalctl -k -n 50 --no-pager
+- Sunshine status / logs: $ systemctl --user status sunshine   /   $ journalctl --user -u sunshine -n 50 --no-pager
+- Start, stop or restart Sunshine: $ systemctl --user restart sunshine
+- Ollama status / logs: $ systemctl status ollama   /   $ journalctl -u ollama -n 50 --no-pager
+- Start, stop or restart Ollama: $ sudo systemctl restart ollama
 
 Things the user has taught you. Always follow these; they override everything above:
 {memories}
@@ -458,17 +470,36 @@ def get_json(path, timeout=1.5):
         return json.load(resp)
 
 
-def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinking=None):
+class ThinkingTooLong(Exception):
+    pass
+
+
+def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinking=None, on_fallback=None):
     """Yield (text_piece, final_stats_or_None) as the model generates.
 
     With think=True the model reasons first. Ollama sends that reasoning separately
     (message.thinking), so it never reaches the reply text; on_thinking() is called
-    while it happens so the spinner can say so.
+    while it happens so the spinner can say so. If the reasoning runs past THINK_BUDGET
+    tokens before any reply text, the request is dropped and asked again without
+    thinking; the final stats then carry think_fallback=True.
     """
+    if not think:
+        yield from _chat_stream(model, messages, keep_alive, num_predict, False, None)
+        return
+    try:
+        yield from _chat_stream(model, messages, keep_alive, num_predict, True, on_thinking)
+    except ThinkingTooLong:
+        if on_fallback:
+            on_fallback()
+        for piece, done in _chat_stream(model, messages, keep_alive, num_predict, False, None):
+            yield piece, ({**done, "think_fallback": True} if done is not None else None)
+
+
+def _chat_stream(model, messages, keep_alive, num_predict, think, on_thinking):
     payload = {
         "model": model, "messages": messages, "stream": True, "think": think,
         "keep_alive": keep_alive,
-        "options": {"temperature": 0, "num_predict": num_predict + (THINK_TOKENS if think else 0),
+        "options": {"temperature": 0, "num_predict": num_predict + (THINK_BUDGET + 50 if think else 0),
                     "repeat_penalty": 1.1, "num_ctx": NUM_CTX},
     }
     try:
@@ -479,6 +510,7 @@ def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinki
             raise OllamaError(body.strip() or str(e)) from e
         payload.pop("think")  # model doesn't support the think flag
         resp = _post("/api/chat", payload)
+    thought, replied = 0, False
     with resp:
         for raw in resp:
             if not raw.strip():
@@ -488,8 +520,13 @@ def chat_stream(model, messages, keep_alive, num_predict, think=False, on_thinki
                 raise OllamaError(data["error"])
             message = data.get("message") or {}
             piece = message.get("content") or ""
-            if message.get("thinking") and on_thinking:
-                on_thinking()
+            if message.get("thinking"):
+                thought += 1  # Ollama streams roughly one token per chunk
+                if on_thinking:
+                    on_thinking()
+                if think and not replied and thought > THINK_BUDGET:
+                    raise ThinkingTooLong()  # leaving the with block closes the connection
+            replied = replied or bool(piece.strip())
             if data.get("done"):
                 yield piece, data
                 return
@@ -520,11 +557,17 @@ class Spinner:
     def __init__(self, text):
         self.text = text
         self.thinking = False  # set once the model starts reasoning, so a pause isn't blamed on loading
+        self.fell_back = False
         self._stop = threading.Event()
         self._thread = None
 
     def mark_thinking(self):
         self.thinking = True
+
+    def mark_fallback(self):
+        self.thinking = False
+        self.text = "thinking took too long, answering directly"
+        self.fell_back = True
 
     def start(self):
         if TTY:
@@ -539,7 +582,7 @@ class Spinner:
             if self.thinking:
                 text = "thinking it through"
             else:
-                text = self.text if elapsed < 3 else "loading the model (slower after a break)"
+                text = self.text if elapsed < 3 or self.fell_back else "loading the model (slower after a break)"
             sys.stdout.write(f"\r  {paint(self.FRAMES[i % len(self.FRAMES)], MAGENTA)} "
                              f"{paint(f'{text}… {elapsed:.0f}s', DIM)}\033[K")
             sys.stdout.flush()
@@ -592,7 +635,9 @@ def footer(seconds, load_seconds, final=None, thought=False):
     final = final or {}
     if final.get("eval_duration") and (final.get("eval_count") or 0) >= 5:
         parts.append(f"{final['eval_count'] / (final['eval_duration'] / 1e9):.0f} tok/s")
-    if thought:
+    if thought == "fallback" or final.get("think_fallback"):
+        parts.append("thinking took too long, so it answered directly")
+    elif thought:
         parts.append("thought it through first")
     if load_seconds > 1.5:
         parts.append(f"{load_seconds:.1f}s of that was loading the model")
@@ -886,7 +931,7 @@ HELP = """
   clear       clear the screen
   /learned    list everything I've learned     /unlearn <n>   forget one
   /forget     forget this conversation          /raw           show or hide raw output
-  /think      off · auto · on (auto: reason first for "why…" and troubleshooting questions)
+  /think      on · auto · off (on by default: reasons first, up to a budget, then answers directly)
   /facts      show what I know about this machine
   /stats      show the system stats again       exit           quit and free the GPU
 """
@@ -1061,6 +1106,40 @@ def clean_command(text):
             break
         body.append(line.rstrip())
     return "\n".join([first, *body, end])
+
+
+SUDO_USER_RE = re.compile(r"(^|&&|\|\||;)(\s*)sudo\s+(?:-\S+\s+)*((?:systemctl|journalctl)\b[^|;&\n]*?\s--user\b)")
+
+
+def normalise_command(cmd):
+    """Fix mistakes that can never work. Returns (command, list of fixes made).
+
+    sudo + --user: 'sudo systemctl --user restart sunshine' talks to root's user
+    services, not yours, and fails. Both 4B and 9B made this mistake in the eval.
+    """
+    fixes = []
+    head, sep, body = cmd.partition("\n") if HEREDOC_RE.search(cmd.split("\n", 1)[0]) else (cmd, "", "")
+    fixed = SUDO_USER_RE.sub(r"\1\2\3", head)
+    if fixed != head:
+        fixes.append("dropped sudo, because --user services belong to you, not root")
+    return fixed + sep + body, fixes
+
+
+EMBEDDED_RE = re.compile(r"^\s*\$\s+(\S.*)$", re.M)
+
+
+def embedded_command(text):
+    """A reply that's prose plus one '$ command' line: return that command, else None.
+
+    The model sometimes answers "Run this: $ sudo systemctl enable --now sshd" instead of
+    replying with just the command, and then nothing ran. Exactly one such line is needed,
+    so a list of options isn't mistaken for a single action.
+    """
+    lines = EMBEDDED_RE.findall(re.sub(r"```[\w-]*", "", text))
+    if len(lines) != 1:
+        return None
+    cmd = lines[0].strip().strip("`").strip()
+    return cmd if cmd and len(cmd) <= MAX_COMMAND_CHARS and not HEREDOC_RE.search(cmd) else None
 
 
 def command_head(cmd):
@@ -1348,7 +1427,7 @@ def fix_command(session, request, cmd, output):
         spinner.stop()
     if decide(text, True) != "command":
         return None
-    fixed = clean_command(text)
+    fixed, _ = normalise_command(clean_command(text))
     if not fixed or fixed == cmd or "\n" in fixed or len(fixed) > MAX_COMMAND_CHARS:
         return None
     return fixed
@@ -1366,7 +1445,8 @@ def handle(session, request):
     buffer, mode, final, out = "", None, {}, Streamer()
     try:
         for piece, done in chat_stream(session.model, router_messages(session, request), session.keep_alive,
-                                       MAX_REPLY_TOKENS, think=think, on_thinking=spinner.mark_thinking):
+                                       MAX_REPLY_TOKENS, think=think, on_thinking=spinner.mark_thinking,
+                                       on_fallback=spinner.mark_fallback):
             buffer += piece
             final = done or final
             if mode is None:
@@ -1394,6 +1474,8 @@ def handle(session, request):
     session.used_model = True
     load_seconds = (final.get("load_duration") or 0) / 1e9
     mode = mode or decide(buffer, True)
+    if final.get("think_fallback"):
+        think = "fallback"
 
     if mode == "answer":
         out.end()
@@ -1402,6 +1484,9 @@ def handle(session, request):
         footer(time.monotonic() - start, load_seconds, final, thought=think)
         session.remember(request, buffer.strip())
         log({"model": session.model, "request": request, "decision": "answered", "think": think})
+        offered = embedded_command(buffer)
+        if offered and sys.stdin.isatty():
+            offer_embedded(session, request, offered, think)
         return
 
     cmd = clean_command(buffer)
@@ -1413,7 +1498,28 @@ def handle(session, request):
         footer(time.monotonic() - start, load_seconds)
         log({**entry, "command": cmd[:200], "decision": "runaway"})
         return
+    cmd, fixes = normalise_command(cmd)
+    if fixes:
+        entry.update(command=cmd, fixed=fixes, model_command=entry["command"])
+        print(paint(f"\n  (fixed the model's command: {'; '.join(fixes)})", DIM))
     execute(session, request, cmd, entry, start, load_seconds, thought=think)
+
+
+def offer_embedded(session, request, cmd, think):
+    """The answer included one command: offer to run it, through the usual safety checks."""
+    cmd, fixes = normalise_command(cmd)
+    try:
+        answer = input(f"\n  {paint('Run that command?', MAGENTA)} {paint(cmd, CYAN)}  y/N: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer not in ("y", "yes"):
+        return
+    for fix in fixes:
+        print(paint(f"  (fixed: {fix})", DIM))
+    entry = {"model": session.model, "request": request, "command": cmd, "think": think, "offered": True}
+    # Read-only commands run straight away (you just said yes); anything else still asks.
+    execute(session, request, cmd, entry, time.monotonic(), 0.0)
 
 
 def approve(session, request, cmd, entry):
@@ -1568,9 +1674,10 @@ def set_think(session, arg):
     elif arg:
         print(paint("  Use /think off, /think auto or /think on.", DIM))
         return
-    detail = {"off": "never reason first (fastest)",
+    detail = {"off": "never reason first (fastest, least accurate)",
               "auto": "reason first for 'why…', troubleshooting and comparison questions, and when fixing a command",
-              "on": "always reason first (slower, more careful)"}[session.think]
+              "on": f"always reason first, for up to {THINK_BUDGET} tokens, then answer directly (most accurate)"
+              }[session.think]
     print(paint(f"  Thinking is {session.think}: {detail}.", DIM))
 
 
