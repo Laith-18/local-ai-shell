@@ -69,8 +69,7 @@ def test_board_includes_laptop_model(ai, monkeypatch, tmp_path):
 
 
 def test_router_prompt_has_facts_and_shared_rules(ai):
-    prompt = ai.ROUTER_PROMPT.format(context="c", model="m", memories="-", facts=ai.format_facts(FACTS),
-                                     fedora_rules=ai.FEDORA_RULES)
+    prompt = ai.render(ai.ROUTER_PROMPT, context="c", model="m", memories="-", facts=ai.format_facts(FACTS))
     assert "620.70.06" in prompt
     assert '"update" is just another name for "upgrade"' in prompt
     assert "/sys/class/dmi/id/board_name" in prompt
@@ -78,7 +77,7 @@ def test_router_prompt_has_facts_and_shared_rules(ai):
 
 
 def test_summary_prompt_has_facts(ai):
-    prompt = ai.SUMMARY_PROMPT.format(facts=ai.format_facts(FACTS), fedora_rules=ai.FEDORA_RULES)
+    prompt = ai.render(ai.SUMMARY_PROMPT, facts=ai.format_facts(FACTS))
     assert "620.70.06" in prompt and "only column headings" in prompt
 
 

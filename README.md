@@ -30,7 +30,7 @@ ai› how much storage do i have
   - *Destructive commands are always blocked* (`rm -rf /`, `mkfs`, `dd` to a disk, fork bombs).
 - **Learns from you.** Say "remember that…", "from now on…" or "when I say…" and it stores the rule and follows it in every future request. If you correct a command with `e` and it succeeds, it offers to remember the fix. Manage it with `/learned` and `/unlearn`.
 - **Follow-up questions** ("now sort that by size") via short conversation memory.
-- **Distro-aware.** The system prompt teaches it Fedora's conventions: `dnf` for packages (with read-only `dnf`/`rpm` queries allowlisted), Flathub for GUI apps, `systemctl --user` for Sunshine, and never touching the NVIDIA akmod. It started life on Bazzite (immutable Fedora Atomic) and was ported to regular Fedora by rewriting the prompts and safety rules; the original Bazzite rules are in the git history.
+- **Distro-aware: Fedora and Debian/Ubuntu.** It reads `/etc/os-release` and teaches the model that distro's conventions: on Fedora, `dnf` (with read-only `dnf`/`rpm` queries allowlisted) and never touching the NVIDIA akmod; on Debian, Ubuntu, Mint and Pop!_OS, `apt` and `dpkg` (where, unlike dnf, `update` and `upgrade` are different commands), plus snap on Ubuntu. Flathub and `systemctl --user` for Sunshine on both. Override with `AI_SHELL_DISTRO`. It started life on Bazzite (immutable Fedora Atomic) and was ported to regular Fedora by rewriting the prompts and safety rules; the original Bazzite rules are on the `bazzite` branch.
 - **VRAM dynamic.** The model only sits in VRAM while you're using it and is unloaded on exit
 - **Knows the machine it's on.** At startup it checks the OS, CPU, RAM, GPU and driver, motherboard, internet and installed tools, and puts those verified facts in every prompt (`/facts` shows them), plus known-good commands for common questions.
 - **Thinks first, within a budget.** The model reasons before answering (80% → 94% on the eval); after 1,000 tokens of thinking it's asked again without, so a reply never stalls. `/think auto` or `/think off` for speed.
@@ -39,7 +39,7 @@ ai› how much storage do i have
 - **Multi-line paste** (an `nvidia-smi` table, say) arrives as one question.
 - Streaming replies, a welcome screen with live system stats, and speed and load time shown under every answer.
 - Single Python file, standard library only.
-- **Tested and evaluated.** ~425 pytest cases (safety classifier, parsing, Ctrl+C handling, the checks around the model, eval harness) run in CI on Python 3.11–3.14, plus an automated eval harness for comparing models and prompts on 87 tasks. See [Testing & evaluation](#testing--evaluation).
+- **Tested and evaluated.** ~500 pytest cases (safety classifier, parsing, Ctrl+C handling, the checks around the model, eval harness) run in CI on Python 3.11–3.14, plus an automated eval harness for comparing models and prompts on 87 tasks (88 for Debian). See [Testing & evaluation](#testing--evaluation).
 
 ## Hardware & stack
 
@@ -48,7 +48,7 @@ ai› how much storage do i have
 | CPU | Intel i5-9400F (6 cores) |
 | GPU | NVIDIA RTX 2060, 6 GB |
 | RAM | 16 GB DDR4-2400 |
-| OS | Fedora KDE Plasma (originally Bazzite 44, Fedora Atomic) |
+| OS | Fedora KDE Plasma (originally Bazzite 44, Fedora Atomic); Debian/Ubuntu also supported |
 | Inference | Ollama as a native systemd service, NVIDIA driver from RPM Fusion |
 | Model | `qwen3.5:4b` (Q4_K_M) with thinking; `lfm2.5` (8B MoE) and `qwen3.5:9b` for comparison |
 
@@ -57,7 +57,7 @@ ai› how much storage do i have
 ```
 ai › "is sunshine running"
         │
-        ├─▶ system prompt (machine facts + Fedora rules + known-good commands
+        ├─▶ system prompt (machine facts + distro rules + known-good commands
         │   + things you've taught it) + recent conversation
         ▼
   Ollama (localhost:11434) ──▶ qwen3.5:4b on the RTX 2060, thinking first
@@ -190,10 +190,12 @@ python3 eval/run_eval.py --prompt minimal                 # ablation: without ai
 python3 eval/run_eval.py --temperature 0.7 --repeats 5    # how stable is it?
 python3 eval/run_eval.py --regrade eval/results/<run>      # re-score a saved run after grader/safety changes, no GPU
 python3 eval/run_eval.py --think off                      # thinking off|auto|on (default on)
+python3 eval/run_eval.py --distro debian                  # Debian prompt, machine facts and apt tasks
 python3 eval/from_history.py -o eval/drafts.toml          # draft new tasks from questions that went wrong
 ```
 
 - **87 tasks in `eval/tasks.toml`** across 14 categories: disk, processes, logs, services, packages, files, network, hardware, facts it must not guess (time, hostname), writing files, follow-up questions, pasted output, general questions it should *answer* rather than run, and dangerous requests. Nine come from real failures in my own sessions.
+- **Per distro**: `--distro debian` swaps the Fedora-only tasks (dnf, rpm, Fedora version) for the ones in `eval/tasks-debian.toml`, including "what's the difference between apt update and apt upgrade", where repeating the Fedora rule ("they're the same") fails.
 - **Graded by regex** (accepted and rejected forms, e.g. `apt` is wrong on Fedora). Each task also states the **expected safety tier**, so the report flags correct commands that would auto-run when they shouldn't, or prompt when they needn't.
 - **Dangerous requests pass** only if the model refuses, or the command is blocked or needs `yes` typed in full. The run fails if any would have auto-run.
 - **Graded like the real pipeline**: same machine facts (fixed, for fedora-box), same thinking budget and fallback, same command repairs, and a command offered from inside an answer counts as that command.
@@ -206,12 +208,16 @@ python3 eval/from_history.py -o eval/drafts.toml          # draft new tasks from
 - **It's a 4B model.** It's good at single commands and short explanations, and unreliable at multi-step reasoning, obscure facts and anything agentic. It sits well below frontier cloud models. Thinking makes it slower (about 3 s a reply).
 - **The safety checks are a heuristic, not a sandbox.** The allowlist and patterns catch the common cases, but a determined or confused model could produce something they don't anticipate. Commands run as your user, which is why anything outside the read-only list needs your confirmation.
 - **Learned rules go into the prompt**, so a long list eats into the 8K context window. It's capped at 40.
-- **Fedora-specific.** The system prompt assumes Fedora with RPM Fusion. Other distros would need the prompts and package rules rewritten. The benchmark in `bench/` was run on the earlier Bazzite setup and still uses that prompt.
+- **Fedora and Debian/Ubuntu only.** Other distros (Arch, openSUSE, …) get the Fedora rules. **The Debian side hasn't been run against a real model yet:** it's covered by unit tests and the eval's reference answers, but all the accuracy numbers above are from Fedora. The benchmark in `bench/` was run on the earlier Bazzite setup and still uses that prompt.
 - **The eval is small and hand-written:** 87 tasks graded by regex. The regexes can't recognise every valid way to write a command, so a failure in the report is worth reading before trusting.
 
 ## Install
 
-Requires an NVIDIA GPU with the RPM Fusion driver (`akmod-nvidia` + `xorg-x11-drv-nvidia-cuda`) and Python 3.
+Requires an NVIDIA GPU with its proprietary driver, and Python 3:
+
+- **Fedora:** the RPM Fusion driver (`akmod-nvidia` + `xorg-x11-drv-nvidia-cuda`).
+- **Debian:** enable the `contrib non-free non-free-firmware` components, then `sudo apt install linux-headers-amd64 nvidia-driver firmware-misc-nonfree`.
+- **Ubuntu / Mint / Pop!_OS:** `sudo ubuntu-drivers install` (Pop!_OS has an NVIDIA ISO with it preinstalled).
 
 ```bash
 # 1. Install Ollama as a system service (binds to localhost only by default)
@@ -226,7 +232,7 @@ ai
 ```
 
 Inside `ai`: `/help`, `/learned`, `/unlearn <n>`, `/forget`, `/raw`, `/think off|auto|on`, `/facts`, `/stats`, `clear`, `exit`.
-Use a different model with `ai --model <name>` or `AI_SHELL_MODEL`. Other settings: `AI_SHELL_THINK`, `AI_SHELL_THINK_BUDGET` (default 1000), `AI_SHELL_NUM_CTX` (default 8192).
+Use a different model with `ai --model <name>` or `AI_SHELL_MODEL`. Other settings: `AI_SHELL_THINK`, `AI_SHELL_THINK_BUDGET` (default 1000), `AI_SHELL_NUM_CTX` (default 8192), `AI_SHELL_DISTRO` (`fedora` or `debian`, normally detected).
 
 What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 

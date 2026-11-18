@@ -20,6 +20,7 @@ Usage:
   python3 eval/run_eval.py --category services packages --limit 5
   python3 eval/run_eval.py --backend oracle             # replay reference answers (no GPU, used in CI)
   python3 eval/run_eval.py --models qwen3.5:4b qwen3.5:9b --think   # bigger model, reasoning on
+  python3 eval/run_eval.py --distro debian              # Debian/Ubuntu prompt, facts and apt tasks
 
 Writes eval/results/<timestamp>/{results.jsonl,summary.md,meta.json}.
 Standard library only.
@@ -44,6 +45,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TASKS_FILE = Path(__file__).resolve().parent / "tasks.toml"
+DISTROS = ("fedora", "debian")
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # A fixed context line and fixed machine facts, so results don't depend on who runs the
@@ -62,6 +64,18 @@ FIXED_FACTS = {
                   "nmcli", "lspci", "lsusb", "curl", "wget", "git", "python3", "ollama", "sunshine"],
     "not_installed": ["nvtop", "neofetch", "screen", "fzf", "bat", "ripgrep", "inxi"],
 }
+# The same box, imagined running Debian 13, for --distro debian.
+FIXED_CONTEXT_DEBIAN = "user=laith, host=debian-box, cwd=/home/laith, home=/home/laith"
+FIXED_FACTS_DEBIAN = {
+    **FIXED_FACTS,
+    "os": "Debian GNU/Linux 13 (trixie), kernel 6.12.57+deb13-amd64",
+    "gpus": ["NVIDIA GeForce RTX 2060, 6.0 GB VRAM. The NVIDIA driver 550.163.01 is installed and working "
+             "(nvidia-smi works)"],
+    "installed": ["htop", "btop", "fastfetch", "tmux", "jq", "flatpak", "sensors", "dmidecode", "nmcli", "lspci",
+                  "lsusb", "curl", "wget", "git", "python3", "ollama", "sunshine", "docker"],
+    "not_installed": ["podman", "nvtop", "neofetch", "screen", "fzf", "bat", "ripgrep", "inxi", "snap"],
+}
+FIXTURES = {"fedora": (FIXED_CONTEXT, FIXED_FACTS), "debian": (FIXED_CONTEXT_DEBIAN, FIXED_FACTS_DEBIAN)}
 
 MINIMAL_PROMPT = (
     "You are a Linux terminal assistant. If the request needs information from this computer or "
@@ -81,9 +95,20 @@ def load_ai_shell():
     return module
 
 
-def load_tasks(path=TASKS_FILE):
+def load_tasks(path=TASKS_FILE, distro="fedora"):
+    """Tasks for one distro: the shared ones, minus any marked for other distros, plus
+    eval/tasks-<distro>.toml when loading the default task file."""
     with open(path, "rb") as f:
         tasks = tomllib.load(f)["task"]
+    extra = TASKS_FILE.with_name(f"tasks-{distro}.toml") if distro else None
+    if Path(path) == TASKS_FILE and extra and extra.exists():
+        with open(extra, "rb") as f:
+            tasks += tomllib.load(f)["task"]
+    for t in tasks:
+        if not set(t.get("distros", DISTROS)) <= set(DISTROS):
+            raise ValueError(f"{t.get('id')}: distros must be from {DISTROS}")
+    if distro:
+        tasks = [t for t in tasks if distro in t.get("distros", DISTROS)]
     seen = set()
     for t in tasks:
         tid = t.get("id")
@@ -102,10 +127,11 @@ def load_tasks(path=TASKS_FILE):
     return tasks
 
 
-def build_messages(ai, model, task, prompt_style="full"):
+def build_messages(ai, model, task, prompt_style="full", distro="fedora"):
     if prompt_style == "full":
-        system = ai.ROUTER_PROMPT.format(context=FIXED_CONTEXT, model=model, memories="(nothing yet)",
-                                         facts=ai.format_facts(FIXED_FACTS), fedora_rules=ai.FEDORA_RULES)
+        context, facts = FIXTURES[distro]
+        system = ai.render(ai.ROUTER_PROMPT, ai.detect_distro("", distro), context=context, model=model,
+                           memories="(nothing yet)", facts=ai.format_facts(facts))
     else:
         system = MINIMAL_PROMPT
     messages = [{"role": "system", "content": system}]
@@ -335,12 +361,12 @@ def grade(ai, task, text):
 
 
 # ------------------------------------------------------------------ running --
-def run(ai, backend, models, tasks, repeats=1, prompt_style="full", progress=None):
+def run(ai, backend, models, tasks, repeats=1, prompt_style="full", progress=None, distro="fedora"):
     rows = []
     for model in models:
         for repeat in range(repeats):
             for task in tasks:
-                messages = build_messages(ai, model, task, prompt_style)
+                messages = build_messages(ai, model, task, prompt_style, distro)
                 try:
                     reply = backend.chat(model, messages, seed=repeat)
                     error = ""
@@ -435,7 +461,8 @@ def summary_markdown(rows, meta):
     lines = [f"# ai-shell eval: {meta['started']}", "",
              f"- Tasks: {meta['tasks']} · repeats: {meta['repeats']} · temperature: {meta['temperature']}"
              f" · system prompt: {meta['prompt_style']} · backend: {meta['backend']}"
-             + (f" · thinking: {meta['think']} (budget {meta.get('think_budget', '?')})" if "think" in meta else ""),
+             + (f" · thinking: {meta['think']} (budget {meta.get('think_budget', '?')})" if "think" in meta else "")
+             + (f" · distro: {meta['distro']}" if "distro" in meta else ""),
              f"- Host: {meta['host']}", ""]
 
     lines += ["## Summary", "",
@@ -499,6 +526,8 @@ def main(argv=None):
     parser.add_argument("--category", nargs="+", help="only run these categories")
     parser.add_argument("--limit", type=int, help="only the first N tasks (after filtering)")
     parser.add_argument("--backend", choices=["ollama", "oracle"], default="ollama")
+    parser.add_argument("--distro", choices=DISTROS, default="fedora",
+                        help="which distro's prompt, machine facts and tasks to use (not the machine you're on)")
     parser.add_argument("--think", nargs="?", const="on", choices=ai.THINK_MODES, default=ai.DEFAULT_THINK,
                         help=f"reason first: off, auto or on, as in ai-shell (default {ai.DEFAULT_THINK}); "
                              "plain --think means on")
@@ -514,7 +543,7 @@ def main(argv=None):
                         help="re-score a saved run with the current grader and safety code (no GPU)")
     args = parser.parse_args(argv)
 
-    tasks = load_tasks()
+    tasks = load_tasks(distro=args.distro)
     if args.category:
         tasks = [t for t in tasks if t["category"] in args.category]
     if args.limit:
@@ -528,6 +557,8 @@ def main(argv=None):
             old_meta = json.loads((args.regrade / "meta.json").read_text())
         except OSError:
             old_meta = {}
+        if old_meta.get("distro") and old_meta["distro"] != args.distro:
+            tasks = load_tasks(distro=old_meta["distro"])
         rows = regrade(ai, old_rows, tasks)
         meta = {**{k: v for k, v in old_meta.items() if k != "stats"},
                 "tasks": len({r["task"] for r in rows}),
@@ -560,7 +591,7 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     meta = {"started": started.isoformat(timespec="seconds"), "models": args.models, "tasks": len(tasks),
             "repeats": args.repeats, "temperature": args.temperature, "prompt_style": args.prompt_style,
-            "think": args.think, "think_budget": args.think_budget, "num_ctx": args.num_ctx,
+            "think": args.think, "think_budget": args.think_budget, "num_ctx": args.num_ctx, "distro": args.distro,
             "backend": backend.name, "host": f"{platform.node()} · {platform.platform()}",
             "python": platform.python_version()}
 
@@ -581,7 +612,7 @@ def main(argv=None):
     try:
         rows = []
         for model in args.models:
-            rows += run(ai, backend, [model], tasks, args.repeats, args.prompt_style, progress)
+            rows += run(ai, backend, [model], tasks, args.repeats, args.prompt_style, progress, args.distro)
             vram[model] = backend.model_info(model)
             if not args.keep_loaded:
                 backend.unload(model)

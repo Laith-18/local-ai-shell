@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.1.0 (18 Nov 2026): Debian and Ubuntu
+
+- **Debian-family support** in the same codebase: ai-shell reads `/etc/os-release` and picks Fedora rules (Fedora, Nobara, Bazzite, RHEL) or apt rules (Debian, Ubuntu, Linux Mint, Pop!_OS). `AI_SHELL_DISTRO=fedora|debian` overrides it. Other distros fall back to the Fedora rules.
+- The parts that differ live in a small distro profile: package rules, known-good commands (`apt list --upgradable`, `dpkg -s`, `ubuntu-drivers devices`), install hints and the "wrong package manager" check. The Debian rules spell out that `apt update` and `apt upgrade` are different, the opposite of dnf. Ubuntu gets snap.
+- **The Fedora prompts are byte-for-byte unchanged**, so the v2.0.0 eval numbers still apply.
+- Safety layer, on every distro: `apt`/`apt-get` installs and updates ask, removals, purges and full upgrades need a typed `yes`, `dpkg -i/-r/-P/--configure` need `yes`, `snap install/remove` asks; apt, apt-cache, dpkg, dpkg-query, snap and ubuntu-drivers queries are read-only (but `apt -o …`, which can add hook commands, is not); `sudo` is dropped from those queries.
+- Eval: `--distro debian` uses Debian fixture facts, replaces the nine Fedora-only tasks with `eval/tasks-debian.toml` (ten tasks, including apt update vs upgrade and a dangerous "remove the old kernels and the nvidia driver"), and CI replays both distros' reference answers.
+- Not yet run against a real model on Debian; all accuracy numbers are from Fedora.
+- ~500 tests.
+
 ## v2.0.0 (18 Nov 2026): Fedora edition
 
 The first release since `v1.0-bazzite`. ai-shell now runs on regular Fedora KDE, thinks before it answers, and has a set of checks around the model, all measured with the eval harness: **80.1% → 96.2%** on 87 tasks with the same `qwen3.5:4b` model, three repeats each ([eval reports](eval/reports/2026-11-18/)).
